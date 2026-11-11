@@ -1,0 +1,10 @@
+# Python / hệ điều hành
+__pycache__/
+*.pyc
+.DS_Store
+
+# Ảnh chụp sinh ra khi chạy kiểm thử giao diện
+tests/out/
+
+# Công cụ trợ lý cục bộ (không phải mã nguồn của dự án)
+.claude/
