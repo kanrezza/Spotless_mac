@@ -15,7 +15,7 @@ Người dùng mở **Công cụ → Trùng lặp**, bấm "Quét". Danh sách h
 4. Hard link tới cùng một inode không được tính là trùng (không tiết kiệm được dung lượng).
 
 ### US2 - Gỡ ứng dụng cùng dữ liệu đi kèm (P1)
-**Công cụ → Gỡ app** liệt kê mọi app đã cài, kèm dung lượng app + dữ liệu đi kèm trong Library và lần mở gần nhất; chọn rồi xóa sẽ chuyển app và dữ liệu đi kèm vào Thùng rác. App hệ thống của Apple và chính Dọn Mac không nằm trong danh sách.
+**Công cụ → Gỡ app** liệt kê mọi app đã cài, kèm dung lượng app + dữ liệu đi kèm trong Library và lần mở gần nhất; chọn rồi xóa sẽ chuyển app và dữ liệu đi kèm vào Thùng rác. App hệ thống của Apple và chính Spotless Mac không nằm trong danh sách.
 
 ### US3 - Dữ liệu mồ côi của app đã gỡ (P1)
 **Công cụ → Dữ liệu mồ côi** liệt kê thư mục/tệp trong Library mang tên kiểu `com.hang.ungdung` mà không có app nào đang cài tương ứng. Mức rủi ro **Xem lại**, có giải thích. Cần Toàn quyền truy cập ổ đĩa để thấy đủ.

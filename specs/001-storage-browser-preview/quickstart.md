@@ -8,7 +8,7 @@ node tests/ui_smoke.js                         # kỳ vọng: "UI SMOKE PASSED" 
 ```
 
 ## Thủ công trên Mac
-1. `python3 src/don_mac.py --install` rồi mở Dọn Mac.
+1. `python3 src/don_mac.py --install` rồi mở Spotless Mac.
 2. Tab **Tệp lớn**: thấy file ≥ 50 MB; bấm cột Kích cỡ để đảo chiều sắp xếp.
 3. Chọn một ảnh thì khung phải hiện ảnh. Chọn PDF thì đọc được trang. Chọn .docx thì hiện trang đầu. Nhấn Space thì Quick Look mở.
 4. Chọn 2 dòng, nhấn ⌘⌫ rồi xác nhận: hai file nằm trong Thùng rác.

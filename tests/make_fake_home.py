@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tạo HOME giả để kiểm thử Dọn Mac: python3 tests/make_fake_home.py /tmp/fh"""
+"""Tạo HOME giả để kiểm thử Spotless Mac: python3 tests/make_fake_home.py /tmp/fh"""
 import os, sys, time, shutil, zipfile
 root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/tmp/fh")
 shutil.rmtree(root, ignore_errors=True)
@@ -20,7 +20,7 @@ except ImportError:
     open(J("Downloads", "IMG_6091.jpg"), "wb").write(b"\xff\xd8\xff")
     open(J("Documents", "Báo cáo thực tập.pdf"), "wb").write(b"%PDF-1.4\n%%EOF\n")
 open(J("Documents/Project/src", "main.py"), "w").write("\n".join(f"print('dòng {i}')" for i in range(300)))
-open(J("Documents", "ghi chú.txt"), "w").write("Xin chào Dọn Mac\nDòng 2\n")
+open(J("Documents", "ghi chú.txt"), "w").write("Xin chào Spotless Mac\nDòng 2\n")
 with zipfile.ZipFile(J("Downloads", "Mẫu báo cáo.docx"), "w") as z:
     z.writestr("word/document.xml", "<w:document/>")
 with open(J("Downloads", "pycharm-2026.2.3-aarch64.dmg"), "wb") as f:

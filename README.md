@@ -1,4 +1,4 @@
-# Dọn Mac
+# Spotless Mac
 
 Công cụ dọn dung lượng cho macOS, chạy hoàn toàn trên máy bạn. Một file Python duy nhất (chỉ dùng thư viện chuẩn), giao diện giống mục **Dung lượng** của macOS, có xem trước ảnh/tài liệu và giải thích "nên hay không nên xóa" cho từng mục.
 
@@ -14,7 +14,7 @@ Công cụ dọn dung lượng cho macOS, chạy hoàn toàn trên máy bạn. M
 python3 src/don_mac.py --install
 ```
 
-Lệnh này biên dịch app gốc `Dọn Mac.app` vào thư mục Ứng dụng (cần Xcode Command Line Tools: `xcode-select --install`). Mở bằng Spotlight rồi bật **Toàn quyền truy cập ổ đĩa** cho Dọn Mac một lần là app không hỏi quyền nữa. Cập nhật code sau này chỉ cần chạy lại lệnh trên; quyền đã cấp được giữ nguyên.
+Lệnh này biên dịch app gốc `Spotless Mac.app` vào thư mục Ứng dụng (cần Xcode Command Line Tools: `xcode-select --install`). Mở bằng Spotlight rồi bật **Toàn quyền truy cập ổ đĩa** cho Spotless Mac một lần là app không hỏi quyền nữa. Cập nhật code sau này chỉ cần chạy lại lệnh trên; quyền đã cấp được giữ nguyên.
 
 Chạy thử không cần cài: `python3 src/don_mac.py`.
 
@@ -45,7 +45,7 @@ python3 src/don_mac.py --auto-clean --min-mb 200             # dọn các mục 
 
 - Vùng bảo vệ (thư mục nhà, Documents, Keychains, `.ssh`…) không bao giờ xóa được.
 - Mục trong **Luôn giữ**, và thư mục chứa chúng, không xóa được bằng bất kỳ đường nào.
-- Dọn Mac không đổi cài đặt hệ thống và không phải phần mềm diệt virus; phần bảo mật chỉ hiển thị trạng thái.
+- Spotless Mac không đổi cài đặt hệ thống và không phải phần mềm diệt virus; phần bảo mật chỉ hiển thị trạng thái.
 - Một số thao tác luôn xóa vĩnh viễn (Docker, Homebrew, simulator, snapshot Time Machine): app báo rõ trước khi xóa.
 
 ## Kiểm thử

@@ -7,7 +7,7 @@ Sync Impact Report
 - Templates: plan-template.md ✅ (Constitution Check đọc file này lúc chạy), spec/tasks templates ✅ không cần sửa
 - Follow-up TODOs: none
 -->
-# Dọn Mac Constitution
+# Spotless Mac Constitution
 
 ## Core Principles
 

@@ -12,7 +12,7 @@
 
 ### User Story 1 - Xem và xóa Tệp lớn như trong macOS (Priority: P1)
 
-Người dùng mở Dọn Mac, chọn tab **Tệp lớn**, thấy một bảng giống hệt màn hình "Tài liệu" của macOS: các cột Tên, Loại, Truy cập sau cùng, Kích cỡ, mặc định sắp xếp theo kích cỡ giảm dần. Họ chọn một hoặc nhiều dòng (click, ⌘-click, ⇧-click), bấm **Xóa…**, xác nhận, và các file được chuyển vào Thùng rác. Nút **Hiển thị trong Finder** mở Finder tại file đang chọn.
+Người dùng mở Spotless Mac, chọn tab **Tệp lớn**, thấy một bảng giống hệt màn hình "Tài liệu" của macOS: các cột Tên, Loại, Truy cập sau cùng, Kích cỡ, mặc định sắp xếp theo kích cỡ giảm dần. Họ chọn một hoặc nhiều dòng (click, ⌘-click, ⇧-click), bấm **Xóa…**, xác nhận, và các file được chuyển vào Thùng rác. Nút **Hiển thị trong Finder** mở Finder tại file đang chọn.
 
 **Why this priority**: Đây là thao tác lấy lại dung lượng nhanh nhất và là thứ người dùng đã quen dùng trong macOS; không có nó thì tính năng không có giá trị.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kiểm thử lõi Dọn Mac trên HOME giả. Chạy: HOME=/tmp/fh python3 tests/test_core.py"""
+"""Kiểm thử lõi Spotless Mac trên HOME giả. Chạy: HOME=/tmp/fh python3 tests/test_core.py"""
 import importlib.util, json, os, sys, threading, time, urllib.request, urllib.error
 SRC = os.path.join(os.path.dirname(__file__), "..", "src", "don_mac.py")
 spec = importlib.util.spec_from_file_location("d", SRC); d = importlib.util.module_from_spec(spec); spec.loader.exec_module(d)
@@ -93,7 +93,7 @@ def req(path, body=None, headers=None, token=True):
         return e.code, e.read(), dict(e.headers)
 txt = kids["ghi chú.txt"]
 st, body, _ = req("/api/text", {"id": txt["id"]})
-check(st == 200 and "Xin chào Dọn Mac" in json.loads(body)["text"], "/api/text đọc tiếng Việt")
+check(st == 200 and "Xin chào Spotless Mac" in json.loads(body)["text"], "/api/text đọc tiếng Việt")
 pdf = kids["Báo cáo thực tập.pdf"]; real = open(pdf["path"], "rb").read()
 st, body, hd = req(f"/api/file?id={pdf['id']}&t={d.TOKEN}", token=False)
 check(st == 200 and body == real and hd["Content-Type"] == "application/pdf", "/api/file trả đúng PDF")

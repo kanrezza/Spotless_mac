@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Dọn Mac 2.0: công cụ dọn dung lượng chạy ngay trên máy bạn.
+Spotless Mac: công cụ dọn dung lượng chạy ngay trên máy bạn.
 
 CÀI THÀNH APP (chỉ cần làm 1 lần), trong Terminal:
     python3 ~/Downloads/don_mac.py --install
-→ Biên dịch app gốc macOS "Dọn Mac.app" (cửa sổ riêng, icon trên Dock) vào thư mục Ứng dụng.
-  Sau đó mở bằng Launchpad / Spotlight (⌘ + Space, gõ "Dọn Mac") như mọi app khác.
-  Bật "Toàn quyền truy cập ổ đĩa" cho Dọn Mac MỘT LẦN là không bị hỏi quyền nữa.
+→ Biên dịch app gốc macOS "Spotless Mac.app" (cửa sổ riêng, icon trên Dock) vào thư mục Ứng dụng.
+  Sau đó mở bằng Launchpad / Spotlight (⌘ + Space, gõ "Spotless Mac") như mọi app khác.
+  Bật "Toàn quyền truy cập ổ đĩa" cho Spotless Mac MỘT LẦN là không bị hỏi quyền nữa.
 
 Hoặc chạy trực tiếp không cần cài:
     python3 don_mac.py
@@ -39,8 +39,9 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.0.1"
-APP_NAME = "Dọn Mac"
+VERSION = "5.1.0"
+APP_NAME = "Spotless Mac"
+LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
 NATIVE = "--native" in sys.argv  # chạy bên trong app gốc (cửa sổ Swift)
 APP_MODE = "--app" in sys.argv or NATIVE
@@ -355,7 +356,7 @@ def A(what, ok, keep, tip="", when=""):
 ADVICE = {
     "trash": A("Những gì bạn đã xóa trước đó nhưng vẫn nằm trong Thùng rác và vẫn chiếm ổ đĩa.",
                "Mọi thứ trong Thùng rác, nếu chắc không cần khôi phục.",
-               "Sau khi dọn sạch thì không lấy lại được nữa, kể cả các file Dọn Mac vừa chuyển vào.",
+               "Sau khi dọn sạch thì không lấy lại được nữa, kể cả các file Spotless Mac vừa chuyển vào.",
                "Mở Thùng rác trong Finder lướt qua một lần trước khi dọn."),
     "tm_snap": A("Bản chụp nhanh Time Machine lưu tạm ngay trên ổ máy, được tạo mỗi giờ khi có bật Time Machine.",
                  "Tất cả: bản sao lưu thật trên ổ Time Machine không bị ảnh hưởng.",
@@ -364,7 +365,7 @@ ADVICE = {
     "app_old": A("Ứng dụng đã lâu không mở, cùng dữ liệu đi kèm (cài đặt, cache).",
                  "App và dữ liệu đi kèm: tất cả vào Thùng rác, tải lại được từ App Store/trang chủ.",
                  "Dữ liệu đi kèm có thể chứa cài đặt, tài khoản đăng nhập hoặc file nội bộ của app (ví dụ lịch sử chat).",
-                 "Nếu cần giữ dữ liệu, gỡ app bằng Finder thay vì Dọn Mac."),
+                 "Nếu cần giữ dữ liệu, gỡ app bằng Finder thay vì Spotless Mac."),
     "app_recent": A("Ứng dụng bạn mới dùng gần đây (hoặc macOS chưa ghi nhận lần mở).",
                     "App bạn chắc chắn không dùng nữa.",
                     "Bạn vẫn đang dùng app này. Gỡ đi sẽ mất cả cài đặt và dữ liệu đi kèm của nó.",
@@ -460,7 +461,7 @@ ADVICE = {
 
 # "Nên xóa khi nào" cho từng nhóm Đề xuất
 WHEN = {
-    "trash": "Khi bạn đã lướt qua Thùng rác và chắc chắn không cần khôi phục gì. Làm sau cùng, vì các file Dọn Mac vừa chuyển vào cũng nằm ở đây.",
+    "trash": "Khi bạn đã lướt qua Thùng rác và chắc chắn không cần khôi phục gì. Làm sau cùng, vì các file Spotless Mac vừa chuyển vào cũng nằm ở đây.",
     "tm_snap": "Khi ổ đĩa sắp đầy và bạn cần chỗ ngay. Không cần làm thường xuyên: macOS tự xóa snapshot khi thiếu chỗ.",
     "app_old": "Khi app đã hơn 6 tháng không mở và bạn không nhớ dùng nó vào việc gì. Cần lại thì tải lại được.",
     "app_recent": "Chỉ khi bạn đã quyết định thôi dùng app này hẳn (ví dụ đã chuyển sang app khác) và đã xuất/sao lưu dữ liệu cần giữ.",
@@ -622,11 +623,11 @@ def advise_path(path, is_dir, size=None, used=None):
     ext = os.path.splitext(name)[1].lower()
     lib = LIB + os.sep
     if not deletable(path):
-        return "careful", A("Thư mục hệ thống hoặc dữ liệu được Dọn Mac bảo vệ.",
-                            "Không xóa trực tiếp trong Dọn Mac.",
+        return "careful", A("Thư mục hệ thống hoặc dữ liệu được Spotless Mac bảo vệ.",
+                            "Không xóa trực tiếp trong Spotless Mac.",
                             "Xóa nhầm có thể làm hỏng app, mất mật khẩu (Keychain), khóa SSH hoặc dữ liệu cá nhân.",
                             "Mở vào bên trong để tìm mục con nặng; nhóm Đề xuất đã gom sẵn những phần xóa được.",
-                            "Không xóa trong Dọn Mac. Chỉ đụng tới khi bạn hiểu rõ và làm thủ công bằng Finder.")
+                            "Không xóa trong Spotless Mac. Chỉ đụng tới khi bạn hiểu rõ và làm thủ công bằng Finder.")
     if path.startswith(os.path.join(LIB, "Caches") + os.sep):
         return "safe", ADVICE["cache"]
     if "/data/library/caches/" in low or any(f"/{c.lower()}/" in low + "/" for c in APP_CACHE_DIRS if "/" not in c) \
@@ -711,7 +712,7 @@ def advise_path(path, is_dir, size=None, used=None):
             return "safe", A(f"File cài đặt. Máy đã cài {app}.", "Xóa được: app đã cài xong, file này không còn cần.",
                              "Chỉ giữ nếu bạn cần đúng phiên bản này để cài lại.", "Cần thì tải bản mới từ trang chủ." + age_tip,
                              "Ngay bây giờ: app đã được cài xong.")
-        return "review", A("File cài đặt; Dọn Mac không thấy app tương ứng trong Ứng dụng.",
+        return "review", A("File cài đặt; Spotless Mac không thấy app tương ứng trong Ứng dụng.",
                            "Nếu đã cài vào nơi khác hoặc không định cài nữa.",
                            "Có thể bạn chưa cài app này. Xóa thì phải tải lại.", "Mở file để kiểm tra trước." + age_tip,
                            "Khi bạn xác nhận không còn định cài app đó, hoặc app đã được cài từ nguồn khác (App Store, Homebrew…).")
@@ -747,7 +748,7 @@ def advise_path(path, is_dir, size=None, used=None):
                            "Bấm đúp để mở vào trong và xem từng mục trước khi xóa cả thư mục." + age_tip,
                            "Khi project/thư mục này đã hết dùng và bạn đã mở ra kiểm tra nội dung bên trong.")
     return "review", A("File không rõ mục đích.", "Nếu bạn nhận ra và không cần nữa.",
-                       "Dọn Mac không đoán được file này dùng làm gì; có thể là dữ liệu của app hoặc project.",
+                       "Spotless Mac không đoán được file này dùng làm gì; có thể là dữ liệu của app hoặc project.",
                        "Mở xem trước, hoặc Hiển thị trong Finder để xem nó nằm cạnh những gì." + age_tip,
                        "Chỉ khi bạn nhận ra file đó và biết chắc không cần nữa. Không nhận ra thì để nguyên.")
 
@@ -1015,7 +1016,7 @@ def scan_trash(items, warn):
         os.listdir(TRASH)
     except PermissionError:
         warn.append("Chưa đọc được Thùng rác và một phần ~/Library. Hãy bật “Toàn quyền truy cập ổ đĩa” cho "
-                    + ("Dọn Mac" if APP_MODE else "Terminal") + ", rồi mở lại tool.")
+                    + ("Spotless Mac" if APP_MODE else "Terminal") + ", rồi mở lại tool.")
         return
     add(items, "trash", "Dọn sạch Thùng rác", du(TRASH), path=TRASH, kind="empty_trash", risk="review",
         note="Xóa vĩnh viễn mọi thứ đang nằm trong Thùng rác.")
@@ -1473,7 +1474,7 @@ def unsafe_reason(p):
         while link.startswith(HOME + os.sep) and not os.path.islink(link):
             link = os.path.dirname(link)
         via = f" qua liên kết {home_short(link)}" if os.path.islink(link) else ""
-        return f"thực chất nằm ở {full}{via}, ngoài thư mục nhà, nên Dọn Mac không tự xóa"
+        return f"thực chất nằm ở {full}{via}, ngoài thư mục nhà, nên Spotless Mac không tự xóa"
     if full in PROTECTED:
         return "là thư mục được bảo vệ"
     return None
@@ -2417,7 +2418,7 @@ def scan_ai(step):
                                              "Thoát app trước khi xóa.", ELECTRON_DIRS["Local Storage"][4])
                 else:
                     risk, adv = "review", A(
-                        f"Thư mục “{nm}” trong dữ liệu của {n} ({human(s)}). Dọn Mac chưa nhận diện tên này nên chưa biết chính xác nó lưu gì.",
+                        f"Thư mục “{nm}” trong dữ liệu của {n} ({human(s)}). Spotless Mac chưa nhận diện tên này nên chưa biết chính xác nó lưu gì.",
                         "Cân nhắc nếu nó phình to bất thường: tên thư mục dạng cache/tmp/log thường dọn được; "
                         "tên dạng data/db/storage/session thường là dữ liệu cục bộ.",
                         "Có thể là dữ liệu cục bộ của app (đăng nhập, bản nháp, lịch sử offline). Xóa có thể phải đăng nhập lại hoặc mất bản nháp chưa đồng bộ.",
@@ -2890,7 +2891,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Dọn Mac</title>
+<title>Spotless Mac</title>
 <style>
 :root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#e5e5ea;--alt:#f7f7f9;--accent:#0a84ff;
 --sel:#0a64d6;--seltext:#fff;--danger:#ff3b30;--safe:#1f9d55;--safe-bg:#e3f6ea;--review:#b26a00;--review-bg:#fff2d6;
@@ -3057,7 +3058,7 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
 <body>
 <div class="top">
   <header>
-    <div><h1>Dọn Mac<small>v__VERSION__</small></h1></div>
+    <div><h1>Spotless Mac<small>v__VERSION__</small></h1></div>
     <div class="disk" id="disk">…</div>
   </header>
   <div class="seg" id="tabs">
@@ -3152,7 +3153,7 @@ function macDate(t){if(!t)return "—";const d=new Date(t*1000),p=n=>String(n).p
   return `${p(d.getHours())}:${p(d.getMinutes())} ${d.getDate()}/${d.getMonth()+1}/${String(d.getFullYear()).slice(2)}`}
 const fileURL=(e,kind="file")=>`/api/${kind}?id=${e.id}&t=${encodeURIComponent(TOKEN)}`;
 function icon(e){if(e.is_dir&&!e.name.endsWith(".app"))return ICON.dir;const x=(e.name.split(".").pop()||"").toLowerCase();return ICON_EXT[x]||ICON[e.preview]||"📄"}
-function goneScreen(){dead=true;document.body.innerHTML='<div class="top"><h1>Dọn Mac đã tắt</h1><p class="mut">Mở lại app Dọn Mac để dùng tiếp.</p></div>'}
+function goneScreen(){dead=true;document.body.innerHTML='<div class="top"><h1>Spotless Mac đã tắt</h1><p class="mut">Mở lại app Spotless Mac để dùng tiếp.</p></div>'}
 async function api(path,body){
   if(dead)return {};
   try{const r=await fetch(path,{method:body===undefined?"GET":"POST",
@@ -3174,13 +3175,13 @@ function renderSys(s){
 }
 function renderOnboard(){
   $("list").innerHTML=`<div class="onb"><h2>🔐 Cấp quyền một lần là xong</h2>
-  <p>macOS không cho app nào tự cấp quyền cho chính nó. Bạn chỉ cần bật <b>Toàn quyền truy cập ổ đĩa</b> cho Dọn Mac <b>một lần</b>. Từ đó app quét được mọi thư mục mà không hỏi lại nữa.</p>
+  <p>macOS không cho app nào tự cấp quyền cho chính nó. Bạn chỉ cần bật <b>Toàn quyền truy cập ổ đĩa</b> cho Spotless Mac <b>một lần</b>. Từ đó app quét được mọi thư mục mà không hỏi lại nữa.</p>
   <ol><li>Bấm <b>Mở Cài đặt</b>.</li>
-  <li>Bấm nút <b>+</b> ở cuối danh sách, chọn <b>Dọn Mac</b> trong thư mục Ứng dụng, rồi bật công tắc. Cách khác: bấm <b>Hiện Dọn Mac trong Finder</b> rồi kéo icon vào danh sách.</li>
-  <li>Khi macOS hỏi <b>Thoát &amp; mở lại</b>, bấm đồng ý (hoặc bấm <b>Mở lại Dọn Mac</b>).</li></ol>
+  <li>Bấm nút <b>+</b> ở cuối danh sách, chọn <b>Spotless Mac</b> trong thư mục Ứng dụng, rồi bật công tắc. Cách khác: bấm <b>Hiện Spotless Mac trong Finder</b> rồi kéo icon vào danh sách.</li>
+  <li>Khi macOS hỏi <b>Thoát &amp; mở lại</b>, bấm đồng ý (hoặc bấm <b>Mở lại Spotless Mac</b>).</li></ol>
   <div class="btns"><button class="small" data-act="open_fda">Mở Cài đặt</button>
-  <button class="small" data-act="reveal_app">Hiện Dọn Mac trong Finder</button>
-  <button class="small" id="relaunch">Mở lại Dọn Mac</button>
+  <button class="small" data-act="reveal_app">Hiện Spotless Mac trong Finder</button>
+  <button class="small" id="relaunch">Mở lại Spotless Mac</button>
   <button class="link" id="skip">Bỏ qua, quét luôn (macOS sẽ hỏi từng thư mục)</button></div></div>`;
 }
 function renderSuggest(){
@@ -3567,7 +3568,7 @@ function renderSettings(s){
       khi tổng ≥ <input type="number" id="schMb" min="10" step="50" value="${c.min_mb}"> MB <button class="small" id="schSave">Lưu</button>
       <span class="mut">${c.installed?"✅ Lịch đang chạy":"Chưa cài lịch"}</span></div>`:`<p class="mut">Chỉ dùng được trên macOS.</p>`}</div>`;
   $("m-keep").innerHTML=`<div class="card"><h2>🔒 Luôn giữ (${s.kept.length})</h2>
-    <p class="k">Dọn Mac không đề xuất và không cho xóa các mục này. Chọn mục ở tab bất kỳ rồi bấm “Luôn giữ” để thêm.</p>
+    <p class="k">Spotless Mac không đề xuất và không cho xóa các mục này. Chọn mục ở tab bất kỳ rồi bấm “Luôn giữ” để thêm.</p>
     ${s.kept.length?`<table class="mini">${s.kept.map(k=>`<tr><td>${esc(k.short)}</td><td class="r"><button class="link" data-unkeep="${esc(k.path)}">Bỏ giữ</button></td></tr>`).join("")}</table>`:`<span class="mut">Chưa có mục nào.</span>`}</div>`;
   const h=s.history,tot=h.filter(x=>x.mode!=="x").reduce((a,b)=>a+(b.size||0),0);
   $("m-hist").innerHTML=`<div class="card"><h2>Lịch sử dọn dẹp</h2>
@@ -3584,15 +3585,15 @@ function renderMachine(r){
     <dt>Đã chạy</dt><dd>${dur(m.uptime)}</dd><dt>Pin</dt><dd>${m.battery?`${m.battery.percent}% · ${esc(m.battery.state)}`:"Không có / không đọc được"}</dd></dl>
     ${m.procs.length?`<table class="mini" style="margin-top:10px"><tr><th>Tiến trình ngốn nhiều CPU</th><th class="r">CPU</th><th class="r">RAM</th></tr>${m.procs.map(p=>`<tr><td>${esc(p.name)}</td><td class="r">${p.cpu}%</td><td class="r">${human(p.mem)}</td></tr>`).join("")}</table>`:""}</div>`;
   const dot={ok:"d-safe",warn:"d-careful",unknown:"d-review"};
-  $("m-sec").innerHTML=`<div class="card"><h2>Bảo mật cơ bản (chỉ xem)</h2><p class="k">Dọn Mac không thay đổi cài đặt hệ thống và không phải phần mềm diệt virus.</p>
+  $("m-sec").innerHTML=`<div class="card"><h2>Bảo mật cơ bản (chỉ xem)</h2><p class="k">Spotless Mac không thay đổi cài đặt hệ thống và không phải phần mềm diệt virus.</p>
     ${r.security.map(x=>`<div class="secrow"><span class="dot ${dot[x.state]}" style="margin-top:6px"></span><b>${esc(x.label)}</b><span>${esc(x.value)}</span>${x.state==="warn"?`<span class="hint">${esc(x.hint)}</span>`:""}</div>`).join("")}</div>`;
-  $("m-start").innerHTML=`<div class="card"><h2>Mục tự khởi động (${r.startup.length})</h2><p class="k">Chương trình chạy cùng máy. Mục đánh dấu “không còn chương trình” thường là dấu vết của app đã gỡ. Dọn Mac chỉ liệt kê, hãy xóa bằng Finder nếu chắc chắn.</p>
+  $("m-start").innerHTML=`<div class="card"><h2>Mục tự khởi động (${r.startup.length})</h2><p class="k">Chương trình chạy cùng máy. Mục đánh dấu “không còn chương trình” thường là dấu vết của app đã gỡ. Spotless Mac chỉ liệt kê, hãy xóa bằng Finder nếu chắc chắn.</p>
     ${r.startup.length?`<table class="mini"><tr><th>Mục</th><th>Chương trình</th><th></th></tr>${r.startup.map(x=>`<tr><td>${esc(x.label)}<div class="mut">${esc(x.where)}</div></td><td>${x.broken?`<span class="badge b-review">không còn chương trình</span> `:""}<span class="mut">${esc(x.program||"")}</span></td><td class="r">${x.id?`<button class="link" data-reveal="${x.id}">Hiện trong Finder</button>`:""}</td></tr>`).join("")}</table>`:`<span class="mut">Không có mục nào ngoài của Apple.</span>`}</div>`;
 }
 async function keepSelected(){
   const ids=tab==="suggest"?items.filter(i=>selected.has(i.id)&&i.path).map(i=>i.id):selEntries().map(e=>e.id);
   if(!ids.length)return;
-  if(!confirm(`Luôn giữ ${ids.length} mục?\n\nDọn Mac sẽ không đề xuất và không cho xóa chúng nữa. Bạn bỏ giữ được trong tab “Máy & cài đặt”.`))return;
+  if(!confirm(`Luôn giữ ${ids.length} mục?\n\nSpotless Mac sẽ không đề xuất và không cho xóa chúng nữa. Bạn bỏ giữ được trong tab “Máy & cài đặt”.`))return;
   await api("/api/keep",{ids});toast("🔒 Đã đánh dấu Luôn giữ");
   selected=new Set();for(const k of ["big","downloads","browse"])T[k].sel=new Set();pvFor=null;
   for(const k of ["big","downloads"])T[k].loaded=false;
@@ -3681,7 +3682,7 @@ document.addEventListener("keydown",e=>{
 $("rescan").onclick=async()=>{await api("/api/scan",{});for(const k of ["big","downloads"])T[k].loaded=false;refresh()};
 $("pickSafe").onclick=()=>{for(const i of items)if(i.risk==="safe")selected.add(i.id);renderSuggest()};
 $("clear").onclick=()=>{selected.clear();renderSuggest()};
-$("quit").onclick=async()=>{if(!confirm("Tắt Dọn Mac?"))return;if(native&&host("quit"))return;await api("/api/quit",{});goneScreen()};
+$("quit").onclick=async()=>{if(!confirm("Tắt Spotless Mac?"))return;if(native&&host("quit"))return;await api("/api/quit",{});goneScreen()};
 $("go").onclick=deleteSelected;
 $("keepBtn").onclick=keepSelected;
 $("reveal").onclick=()=>{const s=selEntries();if(s.length===1)api("/api/reveal",{id:s[0].id})};
@@ -3723,7 +3724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1060, height: 800),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
-        window.title = "Dọn Mac"
+        window.title = "Spotless Mac"
         window.minSize = NSSize(width: 640, height: 480)
         window.contentView = web
         window.center()
@@ -3734,7 +3735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    static let loadingHTML = "<html><body style='margin:0;height:100vh;display:flex;align-items:center;justify-content:center;font:15px -apple-system;color:#888;background:Canvas'><style>:root{color-scheme:light dark}</style>Đang khởi động Dọn Mac…</body></html>"
+    static let loadingHTML = "<html><body style='margin:0;height:100vh;display:flex;align-items:center;justify-content:center;font:15px -apple-system;color:#888;background:Canvas'><style>:root{color-scheme:light dark}</style>Đang khởi động Spotless Mac…</body></html>"
 
     func startServer() {
         guard let res = Bundle.main.resourcePath else { return }
@@ -3788,7 +3789,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     func showError(_ msg: String) {
         let a = NSAlert()
-        a.messageText = "Dọn Mac"
+        a.messageText = "Spotless Mac"
         a.informativeText = msg
         a.alertStyle = .critical
         a.runModal()
@@ -3806,7 +3807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
         let a = NSAlert()
-        a.messageText = "Dọn Mac"
+        a.messageText = "Spotless Mac"
         a.informativeText = message
         a.addButton(withTitle: "OK")
         a.beginSheetModal(for: window) { _ in completionHandler() }
@@ -3815,7 +3816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
         let a = NSAlert()
-        a.messageText = "Dọn Mac"
+        a.messageText = "Spotless Mac"
         a.informativeText = message
         a.addButton(withTitle: "Đồng ý")
         a.addButton(withTitle: "Hủy")
@@ -3847,10 +3848,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let appItem = NSMenuItem()
         main.addItem(appItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Giới thiệu Dọn Mac", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "Giới thiệu Spotless Mac", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "Ẩn Dọn Mac", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(withTitle: "Thoát Dọn Mac", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Ẩn Spotless Mac", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Thoát Spotless Mac", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
         let editItem = NSMenuItem()
@@ -3899,7 +3900,7 @@ for p in "__PY__" /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/pyth
     exec "$p" "$SCRIPT" --app
   fi
 done
-osascript -e 'display alert "Dọn Mac cần Python 3" message "Mở Terminal và chạy: xcode-select --install" as critical'
+osascript -e 'display alert "Spotless Mac cần Python 3" message "Mở Terminal và chạy: xcode-select --install" as critical'
 """
 
 
@@ -3962,9 +3963,10 @@ def install():
     os.makedirs(apps, exist_ok=True)
     dest = os.path.join(apps, f"{APP_NAME}.app")
     for old in targets:
-        o = os.path.join(old, f"{APP_NAME}.app")
-        if os.path.exists(o):
-            shutil.rmtree(o, ignore_errors=True)
+        for nm in (APP_NAME,) + LEGACY_APP_NAMES:
+            o = os.path.join(old, f"{nm}.app")
+            if os.path.exists(o):
+                shutil.rmtree(o, ignore_errors=True)
     c = os.path.join(dest, "Contents")
     os.makedirs(os.path.join(c, "MacOS"))
     os.makedirs(os.path.join(c, "Resources"))
@@ -3986,7 +3988,7 @@ def install():
             "LSMinimumSystemVersion": "11.0", "LSUIElement": not native, "NSHighResolutionCapable": True,
             "LSApplicationCategoryType": "public.app-category.utilities",
             "NSHumanReadableCopyright": "Công cụ dọn dung lượng cá nhân",
-            "NSAppleEventsUsageDescription": "Dọn Mac dùng Finder để chuyển ứng dụng vào Thùng rác.",
+            "NSAppleEventsUsageDescription": "Spotless Mac dùng Finder để chuyển ứng dụng vào Thùng rác.",
             "DonMacPython": sys.executable, "DonMacShell": shell_id if native else "fallback",
             "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True, "NSAllowsArbitraryLoadsInWebContent": True},
         }, f)
@@ -4031,7 +4033,7 @@ def main():
             start_scan()
         server.serve_forever()
         return
-    print(f"Dọn Mac đang chạy tại {url}")
+    print(f"Spotless Mac đang chạy tại {url}")
     print("Nhấn Ctrl+C (hoặc nút “Thoát” trên trang) để tắt.")
     start_scan()
     if APP_MODE:

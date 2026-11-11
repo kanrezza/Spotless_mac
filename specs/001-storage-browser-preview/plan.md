@@ -5,7 +5,7 @@
 
 ## Summary
 
-Thêm vào Dọn Mac giao diện bốn tab giống Cài đặt hệ thống → Dung lượng (Đề xuất, Tệp lớn, Bản tải về,
+Thêm vào Spotless Mac giao diện bốn tab giống Cài đặt hệ thống → Dung lượng (Đề xuất, Tệp lớn, Bản tải về,
 Trình duyệt tệp). Các tab dùng chung một bảng sắp xếp được, chọn được nhiều dòng, và một khung xem trước bên phải.
 Xem trước lấy thẳng nội dung file (ảnh, PDF, video, âm thanh, văn bản) qua một endpoint stream có hỗ trợ Range.
 Các định dạng còn lại dùng hình thu nhỏ do `qlmanage` (Quick Look) tạo, có cache. Space mở Quick Look hệ thống.
