@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -2498,6 +2498,781 @@ def prune_tools(gone_ids):
                     d["wasted"] = sum(g["wasted"] for g in d["groups"])
 
 
+# ------------------------------------------------------------------ 004: Hoạt động (RAM/CPU như Giám sát hoạt động)
+GB = 1024 ** 3
+MB = 1024 ** 2
+SYS_PREFIX = ("/System/", "/usr/", "/sbin/", "/bin/", "/Library/Apple/", "/private/", "/Library/SystemExtensions/")
+USER_PREFIX = ("/usr/local/", "/Applications/", "/opt/")
+CRITICAL_PROCS = {"loginwindow", "windowserver", "launchd", "dock", "finder", "systemuiserver", "controlcenter",
+                  "kernel_task", "coreaudiod", "cfprefsd", "distnoted", "usereventagent", "notificationcenter"}
+CRASH_PROCS = {"crashpad_handler", "chrome_crashpad_handler", "sentry-crashpad", "crashpad"}
+CHROMIUM_IDS = {"com.brave.Browser": "Brave", "com.brave.Browser.beta": "Brave Beta", "com.google.Chrome": "Chrome",
+                "com.google.Chrome.beta": "Chrome Beta", "com.google.Chrome.canary": "Chrome Canary",
+                "com.microsoft.edgemac": "Edge", "com.vivaldi.Vivaldi": "Vivaldi", "com.operasoftware.Opera": "Opera",
+                "org.chromium.Chromium": "Chromium", "company.thebrowser.Browser": "Arc"}
+SAFARI_IDS = {"com.apple.Safari": "Safari", "com.apple.SafariTechnologyPreview": "Safari Technology Preview"}
+BUNDLE_ID_GUESS = {"Brave Browser": "com.brave.Browser", "Google Chrome": "com.google.Chrome", "Microsoft Edge": "com.microsoft.edgemac",
+                   "Vivaldi": "com.vivaldi.Vivaldi", "Opera": "com.operasoftware.Opera", "Chromium": "org.chromium.Chromium",
+                   "Arc": "company.thebrowser.Browser", "Safari": "com.apple.Safari", "Claude": "com.anthropic.claudefordesktop"}
+PROC_HIST = {}
+_APPINFO = {}
+_LIBC = [None]
+
+
+def _libsys():
+    if _LIBC[0] is None:
+        try:
+            import ctypes
+            lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+            _LIBC[0] = (ctypes, lib)
+        except Exception:
+            _LIBC[0] = False
+    return _LIBC[0]
+
+
+def footprint(pid):
+    """Bộ nhớ thật (phys_footprint), đúng con số cột Bộ nhớ của Giám sát hoạt động. None nếu không đọc được."""
+    x = _libsys()
+    if not x:
+        return None
+    ctypes, lib = x
+    buf = ctypes.create_string_buffer(128)  # rusage_info_v0: 96 byte, phys_footprint ở offset 72
+    try:
+        if lib.proc_pid_rusage(pid, 0, buf) != 0:
+            return None
+    except Exception:
+        return None
+    import struct
+    return struct.unpack_from("<Q", buf.raw, 72)[0]
+
+
+def _dur(s):
+    """'1-02:03:04', '440:49.03', '03:04' -> giây."""
+    try:
+        d = 0
+        if "-" in s:
+            a, s = s.split("-", 1)
+            d = int(a)
+        sec = 0.0
+        for p in s.split(":"):
+            sec = sec * 60 + float(p.replace(",", "."))
+        return d * 86400 + sec
+    except ValueError:
+        return 0.0
+
+
+def ps_text(fields):
+    try:
+        r = subprocess.run(["ps", "-A", "-ww", "-o", fields], capture_output=True, text=True, timeout=10,
+                           env=dict(os.environ, LC_ALL="C", LANG="C"))
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def parse_ps(text):
+    rows = []
+    for ln in text.splitlines():
+        p = ln.split(None, 7)
+        if len(p) < 8 or not p[0].isdigit():
+            continue
+        try:
+            rows.append({"pid": int(p[0]), "ppid": int(p[1]), "user": p[2], "rss": int(p[3]) * 1024,
+                         "cpu": float(p[4].replace(",", ".")), "etime": _dur(p[5]), "cputime": _dur(p[6]),
+                         "path": p[7].strip()})
+        except ValueError:
+            continue
+    return rows
+
+
+def parse_args(text):
+    out = {}
+    for ln in text.splitlines():
+        p = ln.strip().split(None, 1)
+        if len(p) < 2 or not p[0].isdigit():
+            continue
+        a = p[1]
+        m = re.search(r"--type=([\w-]+)", a)
+        t = m.group(1) if m else ""
+        if t == "renderer" and "--extension-process" in a:
+            t = "extension"
+        if t == "utility":
+            m = re.search(r"--utility-sub-type=([\w.]+)", a)
+            sub = (m.group(1) if m else "").lower()
+            t = "network" if "network" in sub else ("storage" if "storage" in sub else ("audio" if "audio" in sub else "utility"))
+        out[int(p[0])] = t
+    return out
+
+
+def outer_bundle(path):
+    i = path.find(".app/")
+    return path[:i + 4] if i >= 0 else None
+
+
+def bundle_meta(b):
+    if b not in _APPINFO:
+        info = app_info(b)
+        _APPINFO[b] = {"name": info.get("CFBundleDisplayName") or info.get("CFBundleName") or os.path.basename(b)[:-4],
+                       "bid": info.get("CFBundleIdentifier") or BUNDLE_ID_GUESS.get(os.path.basename(b)[:-4], ""),
+                       "electron": os.path.isdir(os.path.join(b, "Contents/Frameworks/Electron Framework.framework"))}
+    return _APPINFO[b]
+
+
+def is_sys_path(p):
+    if not p.startswith("/") or p.startswith(USER_PREFIX) or "/System/Applications/" in p or p.startswith(HOME + "/"):
+        return False
+    return p.startswith(SYS_PREFIX)
+
+
+def me_user():
+    """UID dạng chuỗi (ps cột uid=): so sánh chủ sở hữu tiến trình, không bị cắt tên dài như cột user."""
+    return str(os.getuid())
+
+
+PTYPE_LABEL = {"renderer": "Trang web / giao diện", "extension": "Tiện ích mở rộng", "gpu-process": "Đồ họa (GPU)",
+               "network": "Mạng", "storage": "Lưu trữ", "audio": "Âm thanh", "utility": "Tiện ích nền",
+               "crash": "Báo cáo sự cố", "zygote": "Khởi tạo tiến trình", "plugin": "Plugin"}
+
+# tên tiến trình (chữ thường) -> (đây là gì, vì sao có thể cao, nên làm gì, đóng được?: ok/careful/no)
+KNOWN_PROCS = {
+    "crashpad_handler": ("Bộ thu báo cáo sự cố (Crashpad) đi kèm các app dùng lõi Chromium/Electron (Claude, Brave, Slack, VS Code…). "
+                         "Bình thường gần như 0% CPU và vài MB RAM: nó chỉ ngồi chờ app bị lỗi để ghi lại.",
+                         "Nếu ngốn CPU cao (hàng chục đến trên 100%) là nó bị kẹt vòng lặp: lỗi đã biết, hay gặp sau khi máy ngủ dậy, "
+                         "app tự cập nhật hoặc app con bị crash liên tục. Lúc đó nó chỉ làm nóng máy, tốn pin, không có ích gì cho bạn.",
+                         "Buộc dừng an toàn: app chủ vẫn chạy bình thường, chỉ tạm không gửi báo cáo lỗi cho tới lần mở lại. "
+                         "Nếu nó kẹt lại lần nữa: thoát hẳn app chủ (⌘Q), mở lại, và cập nhật app.", "ok"),
+    "kernel_task": ("Nhân của macOS: quản lý bộ nhớ, ổ đĩa, mạng, phần cứng.",
+                    "CPU cao thường là macOS cố tình chiếm CPU để hạ nhiệt khi máy nóng (sạc nhanh, phòng nóng, màn hình ngoài). "
+                    "RAM lớn là bộ nhớ hệ thống, bình thường.",
+                    "Không đóng được. Để máy thoáng, kê cao đáy, đóng bớt app nặng nếu máy đang nóng.", "no"),
+    "windowserver": ("Vẽ mọi thứ bạn thấy trên màn hình: cửa sổ, hiệu ứng, con trỏ.",
+                     "Tăng khi mở nhiều cửa sổ/tab, màn hình ngoài độ phân giải cao, hiệu ứng trong suốt, video, nhiều Desktop.",
+                     "Không đóng được. Đóng bớt cửa sổ và tab video; Cài đặt → Trợ năng → Màn hình → bật Giảm độ trong suốt.", "no"),
+    "mds": ("Spotlight: quản lý chỉ mục tìm kiếm.", "Cao sau khi cài/cập nhật macOS, chép nhiều file, cắm ổ mới.", "Không cần làm gì, nó tự xong.", "no"),
+    "mds_stores": ("Spotlight: ghi chỉ mục tìm kiếm.", "Cao khi đang lập chỉ mục lại.", "Chờ vài phút đến vài giờ; ổ ngoài không cần tìm thì thêm vào Cài đặt → Spotlight → Quyền riêng tư.", "no"),
+    "mdworker_shared": ("Spotlight: đọc nội dung file để lập chỉ mục.", "Nhiều bản cùng lúc là bình thường khi có nhiều file mới.", "Không cần làm gì.", "no"),
+    "mdworker": ("Spotlight: đọc nội dung file để lập chỉ mục.", "Cao khi có nhiều file mới.", "Không cần làm gì.", "no"),
+    "corespotlightd": ("Spotlight: chỉ mục dữ liệu bên trong app (thư, ghi chú…).", "Cao sau khi cập nhật macOS.", "Không cần làm gì.", "no"),
+    "spotlight": ("Giao diện tìm kiếm Spotlight (⌘ Space).", "Thường rất nhẹ.", "Không cần làm gì.", "no"),
+    "photoanalysisd": ("App Ảnh phân tích khuôn mặt, vật thể, kỷ niệm.", "Chạy khi máy rảnh, nhất là sau khi nhập nhiều ảnh.", "Không cần làm gì; tự dừng khi bạn dùng máy.", "no"),
+    "mediaanalysisd": ("Phân tích ảnh/video (Văn bản trực tiếp, nhận diện).", "Chạy khi máy rảnh.", "Không cần làm gì.", "no"),
+    "bird": ("Đồng bộ iCloud Drive.", "Cao khi đang tải lên/tải về nhiều file.", "Chờ đồng bộ xong.", "no"),
+    "cloudd": ("Đồng bộ dữ liệu iCloud của các app.", "Cao khi đang đồng bộ.", "Chờ đồng bộ xong.", "no"),
+    "fileproviderd": ("Đồng bộ ổ đám mây (iCloud, Google Drive, OneDrive, Dropbox).", "Cao khi có nhiều file thay đổi.", "Chờ đồng bộ xong.", "no"),
+    "backupd": ("Time Machine đang sao lưu.", "Cao trong lúc sao lưu.", "Để nó chạy xong.", "no"),
+    "softwareupdated": ("Cập nhật phần mềm macOS.", "Cao khi đang tải/chuẩn bị bản cập nhật.", "Để nó chạy xong.", "no"),
+    "tccd": ("Quản lý quyền riêng tư (camera, micro, quyền truy cập file…).", "Thường rất nhẹ; cao chốc lát khi app hỏi quyền.", "Không cần làm gì.", "no"),
+    "trustd": ("Kiểm tra chứng chỉ bảo mật cho kết nối và app.", "Cao chốc lát khi mở nhiều trang/app mới.", "Không cần làm gì.", "no"),
+    "opendirectoryd": ("Quản lý tài khoản người dùng và đăng nhập.", "Thường nhẹ.", "Không cần làm gì.", "no"),
+    "loginwindow": ("Phiên đăng nhập của bạn.", "Thường nhẹ.", "Không được đóng: sẽ đăng xuất.", "no"),
+    "biomeagent": ("Thu thập thói quen dùng máy cho Siri/Apple Intelligence (chỉ trên máy).", "Thường nhẹ.", "Không cần làm gì.", "no"),
+    "contextstoreagent": ("Lưu ngữ cảnh cho Siri/gợi ý.", "Thường nhẹ.", "Không cần làm gì.", "no"),
+    "perfpowerservices": ("Đo năng lượng và hiệu năng (dữ liệu cho mục Pin).", "Thường nhẹ.", "Không cần làm gì.", "no"),
+    "replayd": ("Quay/chia sẻ màn hình (ScreenCaptureKit).", "Cao khi đang quay màn hình hoặc một app (Zoom, Meet, OBS, app AI) đang chụp màn hình.",
+                "Dừng quay/chia sẻ màn hình trong app đang dùng nó.", "no"),
+    "com.apple.driverkit-applebcmwlan": ("Driver Wi‑Fi.", "Cao khi tải nặng qua Wi‑Fi hoặc VPN.", "Không cần làm gì.", "no"),
+    "cloudflarewarp": ("VPN Cloudflare WARP (1.1.1.1).", "Mọi lưu lượng mạng đi qua nó nên tốn CPU khi tải nặng.", "Tắt WARP khi không cần.", "careful"),
+    "syspolicyd": ("Gatekeeper kiểm tra app trước khi mở.", "Cao chốc lát khi mở app mới.", "Không cần làm gì.", "no"),
+    "xprotectservice": ("XProtect quét mã độc.", "Cao chốc lát.", "Không cần làm gì.", "no"),
+    "vtdecoderxpcservice": ("Giải mã video bằng phần cứng.", "Cao khi đang xem video.", "Đóng tab/app video không xem.", "no"),
+    "node": ("Node.js: máy chủ dev, công cụ build hoặc tiện ích chạy nền (thường do VS Code, Claude Code, terminal mở).",
+             "Dev server, watcher và language server có thể giữ hàng trăm MB và ngốn CPU khi theo dõi nhiều file.",
+             "Nếu không còn dùng project đó: dừng bằng Ctrl+C ở terminal, hoặc buộc dừng ở đây.", "careful"),
+    "python": ("Chương trình Python đang chạy.", "Tùy script.", "Buộc dừng nếu bạn biết đó là script nào và không cần nữa.", "careful"),
+    "python3": ("Chương trình Python đang chạy.", "Tùy script.", "Buộc dừng nếu bạn biết đó là script nào và không cần nữa.", "careful"),
+    "java": ("Chương trình Java (thường là Android Studio/Gradle, Minecraft, IntelliJ…).", "Java giữ trước nhiều RAM.", "Dừng Gradle bằng ./gradlew --stop nếu không build nữa.", "careful"),
+    "claude": ("Claude Code (CLI) đang chạy trong terminal.", "Phiên dài, nhiều công cụ chạy nền.", "Thoát phiên bằng /exit khi xong.", "careful"),
+    "codex": ("Codex CLI đang chạy.", "Phiên dài.", "Thoát phiên khi xong.", "careful"),
+    "com.apple.virtualization.virtualmachine": ("Máy ảo của Apple Virtualization (OrbStack, Docker, UTM, Claude Cowork…).",
+                                                "RAM cấp cho máy ảo, thường 2–8 GB.", "Tắt máy ảo/app sở hữu nó khi không dùng.", "careful"),
+    "qemu-system-aarch64": ("Máy ảo QEMU (UTM, Docker, Android Emulator).", "RAM cấp cho máy ảo.", "Tắt máy ảo khi không dùng.", "careful"),
+    "sourcekitservice": ("Phân tích mã Swift cho Xcode.", "Cao khi mở project lớn.", "Đóng project Xcode không dùng.", "careful"),
+}
+
+APP_HINTS = [  # (từ khóa trong mã gói/tên, đây là gì, vì sao nặng, nên làm gì)
+    ("anthropic|claude", "Claude Desktop: app Electron (giao diện web Chromium đóng gói).",
+     "Hội thoại dài có nhiều artifact, ảnh, file đính kèm làm giao diện nặng dần; chế độ Cowork chạy thêm một máy ảo Linux vài GB.",
+     "Mở cuộc trò chuyện mới thay vì kéo dài mãi; thoát hẳn (⌘Q) khi không dùng."),
+    ("orbstack", "OrbStack: chạy Docker và máy ảo Linux.",
+     "RAM là của máy ảo và các container đang chạy; càng nhiều container càng nặng.",
+     "Dừng container không dùng (docker stop) hoặc thoát OrbStack; giới hạn RAM trong OrbStack → Cài đặt → System."),
+    ("docker", "Docker Desktop: máy ảo Linux chạy container.", "RAM cấp cố định cho máy ảo.",
+     "Thoát Docker Desktop khi không dùng; giảm RAM trong Settings → Resources."),
+    ("com.openai|chatgpt", "ChatGPT: app giao diện web.", "Hội thoại dài nặng dần.", "Mở cuộc trò chuyện mới; thoát khi không dùng."),
+    ("com.microsoft.vscode|visual studio code", "VS Code: trình soạn code (Electron) cùng extension và language server.",
+     "Mỗi cửa sổ, extension và language server (TypeScript, Python…) là tiến trình riêng.",
+     "Đóng cửa sổ project không dùng; tắt extension nặng."),
+    ("cursor", "Cursor: trình soạn code (Electron, dựa trên VS Code).", "Như VS Code, cộng thêm chỉ mục AI.", "Đóng cửa sổ project không dùng."),
+    ("xcode", "Xcode.", "Chỉ mục mã, build, Simulator.", "Đóng project và Simulator không dùng."),
+    ("slack", "Slack (Electron).", "Mỗi workspace giữ tin nhắn, ảnh trong bộ nhớ.", "Bỏ bớt workspace ít dùng; thoát khi không cần."),
+    ("discord", "Discord (Electron).", "Gọi thoại/video và kênh nhiều ảnh động.", "Thoát khi không dùng."),
+    ("zalo", "Zalo.", "Lịch sử chat, ảnh, video.", "Thoát khi không dùng."),
+    ("telegram", "Telegram.", "Kênh nhiều ảnh/video.", "Thoát khi không dùng."),
+    ("whatsapp", "WhatsApp.", "Lịch sử chat, ảnh.", "Thoát khi không dùng."),
+    ("messenger", "Messenger.", "Lịch sử chat, ảnh.", "Thoát khi không dùng."),
+    ("teams", "Microsoft Teams.", "Gọi video, nhiều nhóm.", "Thoát khi không họp."),
+    ("zoom", "Zoom.", "Gọi video, chia sẻ màn hình.", "Thoát hẳn sau cuộc gọi (Zoom hay chạy ngầm)."),
+    ("notion", "Notion (Electron).", "Trang dài, cơ sở dữ liệu lớn.", "Thoát khi không dùng."),
+    ("figma", "Figma.", "File thiết kế lớn giữ toàn bộ trong RAM.", "Đóng file không dùng."),
+    ("spotify", "Spotify.", "Bộ đệm nhạc, giao diện web.", "Thoát khi không nghe."),
+    ("adobe", "Ứng dụng Adobe.", "Ảnh/video lớn, bộ đệm hoàn tác.", "Đóng file không dùng; giảm RAM trong Preferences → Performance."),
+    ("com.apple.finalcut", "Final Cut Pro.", "Dự án video, bộ đệm kết xuất.", "Đóng thư viện không dùng."),
+    ("com.google.android.studio", "Android Studio.", "IDE Java + Gradle + máy ảo Android.", "Tắt Emulator, chạy ./gradlew --stop."),
+    ("jetbrains", "IDE JetBrains.", "Java giữ trước nhiều RAM để lập chỉ mục.", "Đóng project không dùng."),
+]
+BROWSER_ADVICE = ("Trình duyệt chạy mỗi tab, mỗi tiện ích mở rộng và mỗi khung trang trong một tiến trình riêng "
+                  "(“Helper (Renderer)”), nên một trình duyệt có hàng chục tiến trình.",
+                  "RAM tăng theo số tab, trang nặng (video, Figma, Google Docs, mạng xã hội cuộn lâu), tab mở lâu ngày và tiện ích mở rộng.",
+                  "Bấm “Xem tab” để biết tab nào nặng nhất rồi đóng tab bạn không xem. Bật Tiết kiệm bộ nhớ "
+                  "(Cài đặt → Hệ thống/Hiệu suất → Memory Saver) để tab không dùng tự ngủ.")
+ELECTRON_ADVICE = ("App Electron: thực chất là một trình duyệt Chromium riêng đóng gói giao diện web.",
+                   "Mỗi app Electron tốn khoảng 200–800 MB dù chỉ để chat/ghi chú, vì phải chạy cả lõi trình duyệt.",
+                   "Nếu ít dùng, mở bản web trong trình duyệt bạn đang dùng thay vì app; thoát app (⌘Q) khi không cần.")
+
+
+def explain_proc(name, ptype, owner):
+    low = name.lower()
+    if low in CRASH_PROCS or ptype == "crash":
+        k = KNOWN_PROCS["crashpad_handler"]
+        return {"what": k[0] + (f" Tiến trình này thuộc {owner}." if owner else ""), "why": k[1], "act": k[2], "close": "ok"}
+    for key in (low, low.split(" ")[0]):
+        if key in KNOWN_PROCS:
+            k = KNOWN_PROCS[key]
+            return {"what": k[0], "why": k[1], "act": k[2], "close": k[3]}
+    if low.startswith("com.apple.webkit.webcontent"):
+        return {"what": "Một trang web đang mở trong Safari (hoặc Mail, app dùng WebKit). Mỗi tab Safari có tiến trình riêng.",
+                "why": "Trang nặng (video, mạng xã hội, tài liệu trực tuyến) dùng hàng trăm MB.",
+                "act": "Bấm “Xem tab” ở nhóm Safari để biết tab nào và đóng tab không xem.", "close": "careful"}
+    if low.startswith("com.apple.webkit."):
+        return {"what": "Tiến trình phụ của WebKit (mạng, đồ họa) phục vụ Safari và các app dùng WebKit.", "why": "Tăng theo số trang đang mở.",
+                "act": "Đóng bớt tab Safari.", "close": "no"}
+    if ptype in ("renderer", "extension", "gpu-process", "network", "storage", "audio", "utility") or "helper" in low:
+        lab = PTYPE_LABEL.get(ptype, "Tiến trình phụ")
+        return {"what": f"{lab} của {owner or 'ứng dụng'}.", "why": "Tăng theo số tab/cửa sổ và nội dung đang mở.",
+                "act": f"Đóng bớt tab/cửa sổ trong {owner or 'app'}, hoặc thoát app. Không nên buộc dừng lẻ: tab tương ứng sẽ báo lỗi “Aw, Snap”.",
+                "close": "careful"}
+    return None
+
+
+def explain_group(g):
+    bid, name = (g.get("bid") or "").lower(), g["label"]
+    if g.get("browser"):
+        w, y, a = BROWSER_ADVICE
+        return {"what": f"{name}: " + w, "why": y, "act": a,
+                "when": "Khi Áp lực bộ nhớ chuyển vàng/đỏ hoặc máy chậm: đóng các tab nặng bạn không xem trước, rồi mới tới cả trình duyệt."}
+    for kw, w, y, a in APP_HINTS:
+        if any(k in bid or k in name.lower() for k in kw.split("|")):
+            return {"what": w, "why": y, "act": a, "when": "Khi bạn không dùng app trong vài giờ tới, hoặc khi máy chậm/Áp lực bộ nhớ vàng."}
+    if g.get("electron"):
+        w, y, a = ELECTRON_ADVICE
+        return {"what": f"{name}. " + w, "why": y, "act": a, "when": "Khi không dùng app trong vài giờ tới."}
+    if g.get("bundle"):
+        if g.get("system"):
+            return {"what": f"{name}: thành phần của macOS.", "why": "Thường nhẹ; cao chốc lát khi đang làm việc nền.",
+                    "act": "Không cần đóng.", "when": "Không cần đóng."}
+        return {"what": f"Ứng dụng {name}.", "why": "RAM tăng theo cửa sổ, tài liệu và dữ liệu đang mở.",
+                "act": "Nếu không dùng, thoát app (⌘Q) để giải phóng RAM. Lưu công việc trước.",
+                "when": "Khi bạn không dùng app trong vài giờ tới."}
+    p = g["procs"][0]
+    e = explain_proc(p["name"], p.get("type", ""), g.get("owner"))
+    if e:
+        return {"what": e["what"], "why": e["why"], "act": e["act"],
+                "when": {"ok": "Ngay khi thấy nó ngốn CPU/RAM bất thường.", "careful": "Khi bạn biết nó là gì và không cần nữa.",
+                         "no": "Không cần đóng: là thành phần của macOS."}[e["close"]]}
+    if g.get("system"):
+        return {"what": f"Tiến trình hệ thống “{name}” của macOS.", "why": "Phục vụ chức năng nền của hệ thống.",
+                "act": "Không đóng. Nếu nó ngốn CPU lâu, khởi động lại máy.", "when": "Không cần đóng."}
+    return {"what": f"Chương trình “{name}” chạy dưới tài khoản của bạn" + (f", mở bởi {g['owner']}." if g.get("owner") else "."),
+            "why": "Spotless Mac chưa nhận diện chương trình này.",
+            "act": "Nếu không biết nó là gì, đừng buộc dừng; tra tên trên mạng hoặc xem đường dẫn bên dưới.",
+            "when": "Chỉ khi bạn biết rõ nó là gì và không cần nữa."}
+
+
+def mem_summary(vm=None, total=None, swap=None, level=None):
+    if vm is None:
+        vm, total = sh(["vm_stat"]), sh(["sysctl", "-n", "hw.memsize"]).strip()
+        swap = sh(["sysctl", "-n", "vm.swapusage"])
+        level = sh(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip()
+    if not vm or not str(total).isdigit():
+        return None
+    total = int(total)
+    m = re.search(r"page size of (\d+) bytes", vm)
+    page = int(m.group(1)) if m else 4096
+
+    def pg(label):
+        mm = re.search(re.escape(label) + r":\s+(\d+)\.", vm)
+        return int(mm.group(1)) * page if mm else 0
+    anon, purge = pg("Anonymous pages"), pg("Pages purgeable")
+    app = (anon - purge) if anon else pg("Pages active")
+    wired, comp = pg("Pages wired down"), pg("Pages occupied by compressor")
+    cached = pg("File-backed pages") + purge
+    used = min(total, app + wired + comp)
+    sw = {}
+    for k in ("total", "used"):
+        mm = re.search(k + r"\s*=\s*([\d.,]+)([MG])", swap or "")
+        if mm:
+            sw[k] = float(mm.group(1).replace(",", ".")) * (GB if mm.group(2) == "G" else MB)
+    lv = {"1": "normal", "2": "warn", "4": "critical"}.get(str(level).strip(), "normal")
+    if lv == "normal" and total and (comp > total * 0.25 or sw.get("used", 0) > total * 0.5):
+        lv = "warn"
+    return {"total": total, "used": used, "app": app, "wired": wired, "compressed": comp, "cached": cached,
+            "swap_used": int(sw.get("used", 0)), "swap_total": int(sw.get("total", 0)), "pressure": lv}
+
+
+def proc_snapshot(ps_main=None, ps_args=None, mem=None):
+    rows = parse_ps(ps_main if ps_main is not None else ps_text("pid=,ppid=,uid=,rss=,pcpu=,etime=,time=,comm="))
+    types = parse_args(ps_args if ps_args is not None else ps_text("pid=,args="))
+    me = me_user()
+    mine = bundle_path()
+    protect = {os.getpid(), os.getppid()}
+    bypid = {r["pid"]: r for r in rows}
+    now_pids = set(bypid)
+    for pid in list(PROC_HIST):
+        if pid not in now_pids:
+            del PROC_HIST[pid]
+    groups = {}
+    for r in rows:
+        path = r["path"]
+        name = os.path.basename(path) or path
+        low = name.lower()
+        fp = footprint(r["pid"])
+        mem_b = fp if fp is not None else r["rss"]
+        bundle = outer_bundle(path)
+        owner_b = bundle
+        q, hop = r, 0
+        while not owner_b and q and q["ppid"] > 1 and hop < 6:
+            q = bypid.get(q["ppid"])
+            owner_b = outer_bundle(q["path"]) if q else None
+            hop += 1
+        owner = bundle_meta(owner_b)["name"] if owner_b else ""
+        ptype = "crash" if low in CRASH_PROCS else types.get(r["pid"], "")
+        hist = PROC_HIST.setdefault(r["pid"], [])
+        hist.append(r["cpu"])
+        del hist[:-6]
+        avg = (r["cputime"] / r["etime"] * 100) if r["etime"] > 60 else 0.0
+        system = r["user"] != me or is_sys_path(path) or low in CRITICAL_PROCS
+        killable = (not system and r["pid"] not in protect and not (mine and path.startswith(mine + "/"))) \
+            or (low in CRASH_PROCS and r["user"] == me)
+        flags = []
+        if low in CRASH_PROCS and (r["cpu"] >= 20 or avg >= 3):
+            flags.append({"lv": "bad", "t": f"Bị kẹt: bộ báo cáo sự cố lẽ ra gần như không dùng CPU, đang dùng {r['cpu']:.0f}%"
+                                            + (f" (trung bình {avg:.0f}% từ lúc chạy)" if avg >= 3 else "")})
+        elif len(hist) >= 3 and min(hist[-3:]) >= 60 and low not in ("kernel_task", "windowserver"):
+            flags.append({"lv": "warn", "t": f"Ngốn CPU liên tục (~{sum(hist[-3:]) / 3:.0f}%)"})
+        elif avg >= 40 and r["etime"] > 3600 and not system:
+            flags.append({"lv": "warn", "t": f"Trung bình {avg:.0f}% CPU từ lúc chạy"})
+        p = {"pid": r["pid"], "name": name, "mem": mem_b, "exact": fp is not None, "cpu": round(r["cpu"], 1),
+             "avg": round(avg, 1), "etime": int(r["etime"]), "type": ptype, "tlabel": PTYPE_LABEL.get(ptype, ""),
+             "user": r["user"], "path": path, "killable": bool(killable), "flags": flags, "owner": owner}
+        e = explain_proc(name, ptype, owner) if (flags or low in CRASH_PROCS) else None
+        if e:
+            p["info"] = e
+        if bundle:
+            key = bundle
+        elif low.startswith("com.apple.webkit."):
+            key = "webkit"
+        else:
+            key = "p:" + name
+        g = groups.get(key)
+        if not g:
+            if bundle:
+                meta = bundle_meta(bundle)
+                bid = meta["bid"]
+                label, electron = meta["name"], meta["electron"]
+            else:
+                bid, electron = "", False
+                label = "Trang web Safari/WebKit" if key == "webkit" else name
+            g = groups[key] = {"key": key, "label": label, "bundle": bundle or "", "bid": bid, "electron": electron,
+                               "browser": "chromium" if bid in CHROMIUM_IDS else ("safari" if bid in SAFARI_IDS else ""),
+                               "mem": 0, "cpu": 0.0, "procs": [], "owners": {}}
+        g["mem"] += mem_b
+        g["cpu"] += r["cpu"]
+        g["procs"].append(p)
+        if owner and not bundle:
+            g["owners"][owner] = g["owners"].get(owner, 0) + 1
+    total = (mem or {}).get("total") or 0
+    out = []
+    for g in groups.values():
+        g["procs"].sort(key=lambda x: -x["mem"])
+        g["n"] = len(g["procs"])
+        g["cpu"] = round(g["cpu"], 1)
+        g["owner"] = max(g["owners"], key=g["owners"].get) if g["owners"] else ""
+        del g["owners"]
+        g["system"] = all(x["user"] != me or is_sys_path(x["path"]) or x["name"].lower() in CRITICAL_PROCS for x in g["procs"]) \
+            or g["bundle"].startswith("/System/Library/")
+        g["can_quit"] = bool(g["bundle"]) and not g["system"] and g["bundle"] != mine and bool(g["bid"])
+        g["flags"] = [f for x in g["procs"] for f in x["flags"]]
+        if total and g["mem"] >= total * 0.15:
+            g["flags"].append({"lv": "warn", "t": f"Chiếm {g['mem'] / total * 100:.0f}% RAM của máy"})
+        g["info"] = explain_group(g)
+        g["procs"] = g["procs"][:40]
+        out.append(g)
+    out.sort(key=lambda g: -g["mem"])
+    return out
+
+
+def activity_suggest(groups, mem):
+    sug = []
+    for g in groups:
+        for p in g["procs"]:
+            if any(f["lv"] == "bad" for f in p["flags"]) and p["killable"]:
+                sug.append({"lv": "bad", "t": f"{p['name']}" + (f" (của {p['owner']})" if p["owner"] else "")
+                            + f" đang dùng {p['cpu']:.0f}% CPU dù lẽ ra gần như 0%: bị kẹt. Buộc dừng an toàn, app chủ vẫn chạy.",
+                            "act": {"kind": "kill", "pid": p["pid"], "name": p["name"], "label": "Buộc dừng"}})
+    if mem and mem["pressure"] in ("warn", "critical"):
+        sug.append({"lv": "bad" if mem["pressure"] == "critical" else "warn",
+                    "t": "Áp lực bộ nhớ đang " + ("đỏ" if mem["pressure"] == "critical" else "vàng")
+                         + ": RAM không đủ nên macOS phải nén và đẩy ra ổ đĩa (swap), máy sẽ chậm. Đóng bớt các app/tab nặng dưới đây."})
+    n = 0
+    for g in groups:
+        if n >= 3 or g["mem"] < 400 * MB:
+            break
+        if g["system"]:
+            continue
+        n += 1
+        if g["browser"]:
+            sug.append({"lv": "info", "t": f"{g['label']} dùng {human(g['mem'])} qua {g['n']} tiến trình. Xem tab nào nặng nhất để đóng.",
+                        "act": {"kind": "tabs", "key": g["key"], "label": "Xem tab"}})
+        else:
+            sug.append({"lv": "info", "t": f"{g['label']} dùng {human(g['mem'])}. {g['info']['act']}",
+                        "act": {"kind": "open", "key": g["key"], "label": "Chi tiết"}})
+    if mem and mem["pressure"] == "normal" and mem["swap_used"] > 2 * GB:
+        sug.append({"lv": "info", "t": f"Đang dùng {human(mem['swap_used'])} swap (RAM tràn ra ổ đĩa). Không sao nếu máy vẫn mượt; "
+                                       "khởi động lại máy sẽ xóa sạch swap."})
+    return sug
+
+
+def activity():
+    mem = mem_summary()
+    groups = proc_snapshot(mem=mem)
+    ncpu = os.cpu_count() or 1
+    return {"mem": mem, "groups": groups, "suggest": activity_suggest(groups, mem), "ncpu": ncpu,
+            "cpu": round(min(100.0, sum(g["cpu"] for g in groups) / ncpu), 1), "t": time.time()}
+
+
+def _proc_now(pid):
+    for r in parse_ps(ps_text("pid=,ppid=,uid=,rss=,pcpu=,etime=,time=,comm=")):
+        if r["pid"] == pid:
+            return r
+    return None
+
+
+def proc_kill(pid, name, force=False):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "PID không hợp lệ"}
+    r = _proc_now(pid)
+    if not r or os.path.basename(r["path"]) != name:
+        return {"ok": False, "error": "Tiến trình đã thoát hoặc đã đổi."}
+    low = name.lower()
+    me = me_user()
+    mine = bundle_path()
+    if r["user"] != me or pid in (os.getpid(), os.getppid()) or (mine and r["path"].startswith(mine + "/")) \
+            or ((is_sys_path(r["path"]) or low in CRITICAL_PROCS) and low not in CRASH_PROCS):
+        return {"ok": False, "error": "Đây là tiến trình hệ thống hoặc của chính Spotless Mac nên không buộc dừng."}
+    import signal
+    try:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    if not force:
+        for _ in range(10):
+            time.sleep(0.2)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return {"ok": True}
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return {"ok": True}
+
+
+def app_quit(bundle, force=False):
+    me, mine = me_user(), bundle_path()
+    if not bundle or not bundle.endswith(".app") or bundle == mine or bundle.startswith("/System/Library/"):
+        return {"ok": False, "error": "Không thoát được app này."}
+    bid = bundle_meta(bundle)["bid"]
+    rows = [r for r in parse_ps(ps_text("pid=,ppid=,uid=,rss=,pcpu=,etime=,time=,comm="))
+            if r["path"].startswith(bundle + "/") and r["user"] == me]
+    if not rows:
+        return {"ok": True}
+    if not force and bid:
+        r = run(["osascript", "-e", f"tell application id {aq(bid)} to quit"], 20)
+        if r and r.returncode == 0:
+            return {"ok": True, "graceful": True}
+    import signal
+    main = [r for r in rows if r["path"].startswith(bundle + "/Contents/MacOS/")] or rows
+    for r in main:
+        try:
+            os.kill(r["pid"], signal.SIGKILL if force else signal.SIGTERM)
+        except OSError:
+            pass
+    return {"ok": True}
+
+
+# ---- tab trình duyệt
+def aq(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+SITE_WEIGHTS = [
+    (r"(^|\.)(youtube\.com|youtu\.be)$", 250, 800, "Video YouTube: bộ đệm video, quảng cáo, danh sách đề xuất; xem càng lâu càng tăng."),
+    (r"meet\.google\.com|zoom\.us|teams\.(microsoft|live)\.com|whereby\.com|discord\.com", 400, 1200,
+     "Gọi video/thoại: xử lý camera, micro, chia sẻ màn hình rất nặng."),
+    (r"figma\.com|canva\.com|miro\.com|excalidraw|tldraw|photopea", 400, 2000,
+     "Công cụ thiết kế giữ toàn bộ bản vẽ trong bộ nhớ; file lớn có thể lên vài GB."),
+    (r"docs\.google\.com|sheets\.google|slides\.google|office\.com|sharepoint\.com|onedrive\.live", 200, 700,
+     "Tài liệu/bảng tính trực tuyến: tài liệu càng dài càng nặng."),
+    (r"mail\.google\.com|outlook\.(live|office|office365)\.com", 200, 500, "Hộp thư web liên tục tải thư mới trong nền."),
+    (r"(^|\.)(facebook\.com|instagram\.com|tiktok\.com|threads\.net|reddit\.com|x\.com|twitter\.com|linkedin\.com)$", 300, 900,
+     "Mạng xã hội: bảng tin cuộn vô tận với video tự phát; cuộn càng lâu càng nặng."),
+    (r"netflix\.com|twitch\.tv|open\.spotify\.com|soundcloud\.com|fptplay|vieon|nhaccuatui|zingmp3|bilibili", 300, 800,
+     "Phát nhạc/video trực tuyến."),
+    (r"chatgpt\.com|chat\.openai\.com|claude\.ai|gemini\.google\.com|perplexity\.ai|grok\.com|copilot\.microsoft\.com|chat\.deepseek", 200, 700,
+     "Trợ lý AI: hội thoại dài với nhiều mã, ảnh, artifact làm trang nặng dần."),
+    (r"notion\.so|notion\.site|clickup\.com|asana\.com|linear\.app|atlassian\.net|trello\.com|airtable\.com", 200, 600,
+     "App làm việc nhóm giao diện nặng."),
+    (r"google\.[a-z.]+/maps|maps\.google|earth\.google", 250, 700, "Bản đồ tải ảnh nền và mô hình 3D."),
+    (r"colab\.research\.google|jupyter|kaggle\.com|replit\.com|codesandbox\.io|stackblitz\.com|vscode\.dev|github\.dev", 250, 800,
+     "Môi trường lập trình trên web."),
+    (r"^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$", 150, 800,
+     "Trang dev chạy trên máy: chế độ dev (hot reload, source map) thường nặng hơn bản thật nhiều."),
+    (r"web\.whatsapp\.com|messenger\.com|chat\.zalo\.me|web\.telegram\.org|app\.slack\.com", 250, 700, "Chat trên web giữ lịch sử tin nhắn và ảnh."),
+    (r"shopee\.|lazada\.|tiki\.vn|amazon\.|aliexpress\.|taobao\.", 200, 500, "Trang mua sắm nhiều ảnh, quảng cáo và mã theo dõi."),
+    (r"(^|\.)(github\.com|gitlab\.com|stackoverflow\.com)$", 80, 250, "Trang lập trình, thường nhẹ trừ khi xem diff rất lớn."),
+]
+
+
+def tab_weight(url):
+    u = url or ""
+    if re.match(r"^(chrome|brave|edge|arc|about|vivaldi|opera|favorites|safari)[-\w]*:", u) or not u:
+        return 20, 60, "Trang nội bộ của trình duyệt, rất nhẹ."
+    rest = u.split("://", 1)[-1].lower()
+    host = rest.split("/", 1)[0].split("?", 1)[0].split("@")[-1]
+    hostname = re.sub(r":\d+$", "", host)
+    for pat, lo, hi, why in SITE_WEIGHTS:
+        if re.search(pat, hostname) or re.search(pat, rest):
+            return lo, hi, why
+    return 60, 200, "Trang web thông thường."
+
+
+US, RS = "\x1f", "\x1e"
+
+
+def _tabs_script(bid, measure):
+    if bid in SAFARI_IDS:
+        return f'''set US to character id 31
+set RS to character id 30
+tell application id {aq(bid)}
+  set out to ""
+  repeat with w in windows
+    try
+      set wid to id of w
+      set ct to 0
+      try
+        set ct to index of current tab of w
+      end try
+      set i to 0
+      repeat with t in tabs of w
+        set i to i + 1
+        set ti to ""
+        try
+          set ti to name of t
+        end try
+        set u to ""
+        try
+          set u to URL of t
+        end try
+        set out to out & wid & US & i & US & i & US & (i = ct) & US & "false" & US & "" & US & ti & US & u & RS
+      end repeat
+    end try
+  end repeat
+  return out
+end tell'''
+    js = '''
+        try
+          set h to (execute t javascript "(performance.memory?performance.memory.usedJSHeapSize:-1)+''")
+        on error errm
+          set h to "ERR:" & errm
+        end try''' if measure else ""
+    return f'''set US to character id 31
+set RS to character id 30
+tell application id {aq(bid)}
+  set out to ""
+  repeat with w in windows
+    try
+      set wid to id of w
+      set ati to 0
+      try
+        set ati to active tab index of w
+      end try
+      set i to 0
+      repeat with t in tabs of w
+        set i to i + 1
+        set h to ""{js}
+        set ti to ""
+        try
+          set ti to title of t
+        end try
+        set u to ""
+        try
+          set u to URL of t
+        end try
+        set tid to i
+        try
+          set tid to id of t
+        end try
+        set ld to "false"
+        try
+          set ld to (loading of t) as text
+        end try
+        set out to out & wid & US & tid & US & i & US & (i = ati) & US & ld & US & h & US & ti & US & u & RS
+      end repeat
+    end try
+  end repeat
+  return out
+end tell'''
+
+
+def _osa_err(err, browser):
+    if "-1743" in err or "not allowed" in err.lower() or "không được phép" in err.lower():
+        return {"error": f"Spotless Mac chưa được phép đọc tab của {browser}.", "perm": True,
+                "hint": f"Mở Cài đặt hệ thống → Quyền riêng tư & Bảo mật → Tự động hóa → Spotless Mac → bật {browser}, rồi bấm Xem tab lại. "
+                        "Spotless Mac chỉ đọc tiêu đề và địa chỉ tab, không đọc nội dung trang."}
+    if "-600" in err or "isn't running" in err or "not running" in err:
+        return {"error": f"{browser} chưa mở."}
+    return {"error": f"Không đọc được tab của {browser}.", "hint": err.strip()[:300]}
+
+
+def parse_tab_rows(out, chromium=True):
+    tabs = []
+    for rec in out.split(RS):
+        f = rec.strip("\n").split(US)
+        if len(f) < 8:
+            continue
+        wid, tid, idx, act, ld, h, ti, u = f[:8]
+        try:
+            idx = int(idx)
+        except ValueError:
+            continue
+        heap, js_err = None, ""
+        if h.startswith("ERR:"):
+            js_err = h[4:]
+        elif h.strip().lstrip("-").isdigit() and int(h) >= 0:
+            heap = int(h)
+        lo, hi, why = tab_weight(u)
+        m = re.match(r"^[a-z]+://([^/?#]+)", u or "")
+        tabs.append({"win": wid.strip(), "id": tid.strip(), "idx": idx, "active": act.strip() == "true",
+                     "loading": ld.strip() == "true", "title": ti, "url": u, "host": (m.group(1) if m else u)[:80],
+                     "lo": lo * MB, "hi": hi * MB, "why": why, "heap": heap, "js_err": js_err})
+    return tabs
+
+
+def rank_tabs(tabs):
+    measured = any(t["heap"] is not None for t in tabs)
+    seen = {}
+    for t in tabs:
+        if t["url"]:
+            seen[t["url"]] = seen.get(t["url"], 0) + 1
+    for t in tabs:
+        t["dup"] = seen.get(t["url"], 0) > 1
+        t["score"] = (t["heap"] if t["heap"] is not None else -1) if measured else (t["lo"] + t["hi"]) / 2
+    tabs.sort(key=lambda t: -t["score"])
+    n = 0
+    shown_dup = set()
+    for t in tabs:
+        heavy = (t["heap"] or 0) >= 150 * MB if measured else t["hi"] >= 700 * MB
+        reasons = []
+        if t["dup"]:
+            if t["url"] in shown_dup:
+                reasons.append("Trang này đang mở nhiều lần: đóng bản thừa.")
+            shown_dup.add(t["url"])
+        if heavy and not t["active"] and n < 3:
+            reasons.append("Nặng nhất trong các tab bạn không xem.")
+            n += 1
+        t["close"] = bool(reasons) and not t["active"]
+        t["reason"] = " ".join(reasons)
+    return measured
+
+
+def browser_tabs(bid, measure=False, groups=None):
+    browser = CHROMIUM_IDS.get(bid) or SAFARI_IDS.get(bid)
+    if not browser:
+        return {"error": "Trình duyệt này chưa được hỗ trợ."}
+    r = run(["osascript", "-e", _tabs_script(bid, measure and bid in CHROMIUM_IDS)], 90 if measure else 25)
+    if not r:
+        return {"error": f"{browser} không phản hồi (quá thời gian)."}
+    if r.returncode != 0:
+        return _osa_err(r.stderr or "", browser)
+    tabs = parse_tab_rows(r.stdout, bid in CHROMIUM_IDS)
+    measured = rank_tabs(tabs)
+    js_off = measure and not measured and any(t["js_err"] for t in tabs)
+    g = next((x for x in (groups or proc_snapshot()) if x["bid"] == bid), None)
+    rend = sorted([p["mem"] for p in g["procs"] if p["type"] == "renderer"], reverse=True) if g else []
+    ext = sum(p["mem"] for p in g["procs"] if p["type"] == "extension") if g else 0
+    gpu = sum(p["mem"] for p in g["procs"] if p["type"] == "gpu-process") if g else 0
+    for t in tabs:
+        t.pop("js_err", None)
+    return {"ok": True, "browser": browser, "bid": bid, "tabs": tabs[:200], "count": len(tabs), "measured": measured,
+            "js_off": js_off, "can_measure": bid in CHROMIUM_IDS, "renderers": rend[:10], "n_renderers": len(rend),
+            "ext_mem": ext, "gpu_mem": gpu, "total": g["mem"] if g else 0}
+
+
+def tab_action(bid, win, tid, idx, url, action):
+    browser = CHROMIUM_IDS.get(bid) or SAFARI_IDS.get(bid)
+    if not browser or action not in ("close", "focus"):
+        return {"ok": False, "error": "Không hỗ trợ."}
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Tab không hợp lệ."}
+    if bid in SAFARI_IDS:
+        body = (f"if URL of tab {idx} of w is {aq(url)} then\n        close tab {idx} of w\n        return \"ok\"\n      end if"
+                if action == "close" else
+                f"if URL of tab {idx} of w is {aq(url)} then\n        set current tab of w to tab {idx} of w\n        set index of w to 1\n"
+                f"        activate\n        return \"ok\"\n      end if")
+        script = f'''tell application id {aq(bid)}
+  repeat with w in windows
+    if (id of w as text) is {aq(win)} then
+      {body}
+    end if
+  end repeat
+  return "notfound"
+end tell'''
+    else:
+        do = ("close t" if action == "close" else
+              "set active tab index of w to i\n          set index of w to 1\n          activate")
+        script = f'''tell application id {aq(bid)}
+  repeat with w in windows
+    if (id of w as text) is {aq(win)} then
+      set i to 0
+      repeat with t in tabs of w
+        set i to i + 1
+        set tid to i as text
+        try
+          set tid to (id of t) as text
+        end try
+        if tid is {aq(tid)} then
+          {do}
+          return "ok"
+        end if
+      end repeat
+    end if
+  end repeat
+  return "notfound"
+end tell'''
+    r = run(["osascript", "-e", script], 20)
+    if not r or r.returncode != 0:
+        return dict(_osa_err((r.stderr if r else "") or "", browser), ok=False)
+    if r.stdout.strip() != "ok":
+        return {"ok": False, "error": "Không tìm thấy tab (có thể đã đóng hoặc đã chuyển trang)."}
+    return {"ok": True}
+
+
 # ------------------------------------------------------------------ 003: thông tin máy, bảo mật, khởi động
 def sh(cmd, t=10):
     r = run(cmd, t)
@@ -2766,6 +3541,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._json({"error": "forbidden"}, 403)
             self._json({"machine": machine_info(), "security": security_info(), "startup": startup_items()})
+        elif self.path == "/api/activity":
+            if not self._authed():
+                return self._json({"error": "forbidden"}, 403)
+            self._json(activity())
         elif self.path == "/api/settings":
             if not self._authed():
                 return self._json({"error": "forbidden"}, 403)
@@ -2859,6 +3638,18 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/reveal_app":
             if bundle_path():
                 run(["open", "-R", bundle_path()], 10)
+            self._json({"ok": True})
+        elif path == "/api/proc_kill":
+            self._json(proc_kill(body.get("pid"), str(body.get("name", "")), bool(body.get("force"))))
+        elif path == "/api/app_quit":
+            self._json(app_quit(str(body.get("bundle", "")), bool(body.get("force"))))
+        elif path == "/api/tabs":
+            self._json(browser_tabs(str(body.get("bid", "")), bool(body.get("measure"))))
+        elif path == "/api/tab_act":
+            self._json(tab_action(str(body.get("bid", "")), str(body.get("win", "")), str(body.get("id", "")),
+                                  body.get("idx"), str(body.get("url", "")), str(body.get("action", ""))))
+        elif path == "/api/open_automation":
+            run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"], 10)
             self._json({"ok": True})
         elif path == "/api/open_orbstack":
             run(["open", "-a", "OrbStack"], 10)
@@ -2992,6 +3783,29 @@ button.badge:hover{filter:brightness(.95)}
 .tr.sel{background:var(--sel)!important;color:var(--seltext)}.tr.sel .go,.tr.sel .mut{color:var(--seltext)}
 .tr.lock{opacity:.62}
 .mut{color:var(--muted)}
+.atools{align-items:center}.atools input[type=search]{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text);min-width:220px}
+.amem{display:flex;height:12px;border-radius:6px;overflow:hidden;background:var(--line);margin:8px 0 6px}
+.amem>div{height:100%}.c-app{background:#0a84ff}.c-wired{background:#ff9f0a}.c-comp{background:#bf5af2}
+.alg{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12.5px}.alg i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}
+.apress{display:flex;align-items:center;gap:8px;font-weight:600}.apress .dot{width:11px;height:11px}
+.sug{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line);font-size:13px}.sug:first-of-type{border-top:0}
+.sug .tx{flex:1}.sug button{margin-left:0;white-space:nowrap}
+.ahead,.arow{display:grid;grid-template-columns:18px minmax(0,1fr) 92px 92px 72px;gap:8px;align-items:center;padding:7px 8px;font-size:13px}
+.ahead{color:var(--muted);font-weight:600;font-size:12px}.ahead .r,.arow .r{text-align:right;font-variant-numeric:tabular-nums}
+.arow{border-top:1px solid var(--line);cursor:pointer}.arow:hover{background:var(--alt)}.arow.sys .an{color:var(--muted)}
+.arow .an{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.arow .caret{color:var(--muted);transition:transform .15s}.arow.open .caret{transform:rotate(90deg)}
+.arow .abar{grid-column:2/-1;height:3px;background:var(--line);border-radius:2px;overflow:hidden}.arow .abar>div{height:100%;background:var(--accent)}
+.arow.hot .acpu{color:var(--careful);font-weight:600}
+.adet{padding:2px 8px 14px 34px}.adet .adv{margin:6px 0 10px}.adet .btns{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 10px}.adet .btns button{margin-left:0}
+.aflag{font-size:12.5px;border-radius:8px;padding:6px 10px;margin:4px 0}.aflag.bad{background:var(--careful-bg);color:var(--careful)}.aflag.warn{background:var(--review-bg);color:var(--review)}
+.mini tr.bad td{background:var(--careful-bg)}.mini td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.pinfo td{font-size:12px;color:var(--muted);border-top:0!important;padding-top:0!important}
+.tabsbox{background:var(--alt);border-radius:10px;padding:10px 12px;margin:4px 0 12px}
+.tabrow{display:grid;grid-template-columns:24px minmax(0,1fr) 150px auto;gap:10px;align-items:center;padding:7px 0;border-top:1px solid var(--line);font-size:13px}
+.tabrow:first-of-type{border-top:0}.tabrow .tt{overflow:hidden}.tabrow .tt b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tabrow .tt .mut{font-size:12px}.tabrow .sz{text-align:right;font-variant-numeric:tabular-nums}.tabrow .sz .bar{margin-top:4px}
+.tabrow.cl{background:linear-gradient(90deg,var(--review-bg),transparent);border-radius:6px}.tabrow .rk{color:var(--muted);text-align:center}
+.tabrow .why{font-size:12px;color:var(--muted);margin-top:2px}.tabrow .rs{font-size:12px;color:var(--review);font-weight:600}
 .grp{padding:12px 10px 5px;font-weight:700;font-size:13px;display:flex;gap:9px;align-items:center;border-bottom:1px solid var(--line)}
 .grp .mut{font-weight:500;margin-left:auto}
 .more{padding:10px;text-align:center;color:var(--muted);font-size:12px}
@@ -3067,6 +3881,7 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
     <button data-tab="downloads">Bản tải về</button>
     <button data-tab="browse">Trình duyệt tệp</button>
     <button data-tab="tools">Công cụ</button>
+    <button data-tab="activity">Hoạt động</button>
     <button data-tab="machine">Máy &amp; cài đặt</button>
   </div>
 </div>
@@ -3091,6 +3906,16 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
       <button data-tool="ai">Dấu vết AI</button>
     </div>
     <div id="tool-body"></div>
+  </div>
+  <div class="view" id="v-activity">
+    <div class="tools atools">
+      <div class="subseg" style="margin:0"><button data-asort="mem">Theo RAM</button><button data-asort="cpu">Theo CPU</button></div>
+      <input id="aq" type="search" placeholder="Tìm app hoặc tiến trình…">
+      <label class="mut"><input type="checkbox" id="asys"> Ẩn tiến trình hệ thống</label>
+      <span class="mut" id="astamp"></span>
+      <button id="apause" style="margin-left:auto">⏸ Tạm dừng</button>
+    </div>
+    <div id="a-sum"></div><div id="a-sug"></div><div id="a-list"></div>
   </div>
   <div class="view" id="v-machine">
     <div id="m-sched"></div><div id="m-keep"></div><div id="m-hist"></div>
@@ -3355,7 +4180,7 @@ function renderPreview(){
 function pvThumbFail(){const b=this.parentNode;if(!b)return;const e=selEntries()[0];
   b.style.height="120px";b.innerHTML=`<div class="big" style="font-size:48px">${e?icon(e):"📄"}</div><div class="note">Không có bản xem trước</div>`}
 function renderFoot(){
-  if(tab==="tools"||tab==="machine")return;
+  if(tab==="tools"||tab==="machine"||tab==="activity")return;
   const tableTab=tab!=="suggest";
   $("reveal").style.display=$("tglPv").style.display=tableTab?"":"none";
   if(!tableTab){
@@ -3385,14 +4210,15 @@ function moveSel(d){
 }
 function setTab(name){
   tab=name; for(const b of document.querySelectorAll("#tabs button"))b.classList.toggle("on",b.dataset.tab===name);
-  const isTool=name==="tools",isMach=name==="machine";
-  $("v-suggest").classList.toggle("on",name==="suggest"); $("v-table").classList.toggle("on",!isTool&&!isMach&&name!=="suggest");
-  $("v-tools").classList.toggle("on",isTool); $("v-machine").classList.toggle("on",isMach);
-  document.querySelector(".foot").style.display=(isTool||isMach)?"none":"";
+  const isTool=name==="tools",isMach=name==="machine",isAct=name==="activity";
+  $("v-suggest").classList.toggle("on",name==="suggest"); $("v-table").classList.toggle("on",!isTool&&!isMach&&!isAct&&name!=="suggest");
+  $("v-tools").classList.toggle("on",isTool); $("v-machine").classList.toggle("on",isMach); $("v-activity").classList.toggle("on",isAct);
+  document.querySelector(".foot").style.display=(isTool||isMach||isAct)?"none":"";
   try{localStorage.setItem("donmac.tab",name)}catch(e){}
   pvFor=null;
   if(isTool){setTool(tool);return}
   if(isMach){loadMachine();return}
+  if(isAct){loadActivity();return}
   if(name==="suggest"){renderSuggest();renderFoot();return}
   renderTable(); if(!T[name].loaded||name==="browse")loadTab(name);
   $("tbody").focus();
@@ -3549,6 +4375,138 @@ async function toolDelete(n){
   await pollTool(n);api("/api/status").then(s=>{if(s.disk){renderDisk(s.disk);items=s.items;renderSuggest()}}).catch(()=>{});
 }
 
+/* ================= 004: Hoạt động ================= */
+const AC={data:null,sort:"mem",open:new Set(),tabs:{},timer:null,paused:false,hideSys:false,q:"",more:false,downAt:0,busy:false};
+try{AC.sort=localStorage.getItem("donmac.asort")||"mem";AC.hideSys=localStorage.getItem("donmac.asys")==="1"}catch(e){}
+const PRESS={normal:["Bình thường","d-safe","RAM đủ dùng. “Đã dùng” cao không có nghĩa là xấu: macOS cố tình dùng RAM trống làm bộ nhớ đệm cho nhanh. Điều cần xem là Áp lực bộ nhớ."],
+  warn:["Cao","d-review","RAM sắp không đủ: macOS đang nén bộ nhớ và đẩy ra ổ đĩa (swap). Đóng bớt app/tab nặng để máy mượt lại."],
+  critical:["Quá tải","d-careful","RAM không đủ: máy sẽ giật, lag. Đóng ngay các app/tab nặng nhất bên dưới."]};
+function loadActivity(){
+  $("asys").checked=AC.hideSys;
+  if(!AC.data)$("a-sum").innerHTML=`<div class="card"><span class="spin"></span>Đang đọc hoạt động của máy…</div>`;
+  if(AC.timer)clearInterval(AC.timer);
+  pollActivity();
+  AC.timer=setInterval(()=>{if(tab!=="activity"||dead){clearInterval(AC.timer);AC.timer=null;return}if(!AC.paused)pollActivity()},3000);
+}
+async function pollActivity(){
+  if(AC.busy)return;AC.busy=true;
+  try{const r=await api("/api/activity");if(r&&r.groups){AC.data=r;
+    const go=()=>{if(Date.now()-AC.downAt<700)return setTimeout(go,300);renderActivity()};go()}}catch(e){}
+  AC.busy=false;
+}
+const gkey=k=>(AC.data?AC.data.groups:[]).find(g=>g.key===k);
+function infoBox(i,risk){
+  if(!i)return"";
+  return `<div class="adv adv-${risk}"><p><b>Đây là gì:</b> ${esc(i.what)}</p>
+    <div class="g"><div><h4>📈 Vì sao tốn RAM/CPU</h4><p>${esc(i.why)}</p></div><div><h4>✅ Nên làm gì</h4><p>${esc(i.act)}</p></div></div>
+    ${i.when?`<p class="when"><b>🕒 Nên đóng khi nào:</b> ${esc(i.when)}</p>`:""}</div>`;
+}
+function renderActivity(){
+  const r=AC.data;if(!r)return;
+  for(const b of document.querySelectorAll("[data-asort]"))b.classList.toggle("on",b.dataset.asort===AC.sort);
+  $("apause").textContent=AC.paused?"▶ Tiếp tục":"⏸ Tạm dừng";
+  $("astamp").textContent=AC.paused?"Đã tạm dừng":"Cập nhật mỗi 3 giây";
+  const m=r.mem;
+  if(m){const P=PRESS[m.pressure]||PRESS.normal,w=x=>(x/m.total*100).toFixed(1)+"%";
+    $("a-sum").innerHTML=`<div class="card"><h2 class="apress"><span class="dot ${P[1]}"></span>Áp lực bộ nhớ: ${P[0]}</h2>
+      <p class="k">${P[2]}</p>
+      <div class="amem"><div class="c-app" style="width:${w(m.app)}"></div><div class="c-wired" style="width:${w(m.wired)}"></div><div class="c-comp" style="width:${w(m.compressed)}"></div></div>
+      <div class="alg"><span><b>${human(m.used)}</b> / ${human(m.total)} đã dùng</span>
+        <span><i class="c-app"></i>Ứng dụng ${human(m.app)}</span><span><i class="c-wired"></i>Hệ thống giữ cố định ${human(m.wired)}</span>
+        <span><i class="c-comp"></i>Đã nén ${human(m.compressed)}</span><span>Bộ nhớ đệm file ${human(m.cached)}</span>
+        <span>Swap ${human(m.swap_used)}</span><span>CPU tổng ${String(r.cpu).replace(".",",")}% (${r.ncpu} nhân)</span></div></div>`;
+  }else $("a-sum").innerHTML=`<div class="card"><h2>Bộ nhớ</h2><p class="k">Chỉ đọc được số liệu RAM trên macOS. CPU tổng ${r.cpu}%.</p></div>`;
+  const ic={bad:"⛔",warn:"⚠️",info:"💡"};
+  $("a-sug").innerHTML=r.suggest.length?`<div class="card"><h2>Nên làm gì bây giờ</h2>${r.suggest.map(s=>{const a=s.act;let b="";
+      if(a&&a.kind==="kill")b=`<button class="small" data-akill="${a.pid}" data-aname="${esc(a.name)}">${esc(a.label)}</button>`;
+      if(a&&a.kind==="tabs")b=`<button class="small" data-atabs="${esc(a.key)}">${esc(a.label)}</button>`;
+      if(a&&a.kind==="open")b=`<button class="small" data-aopen="${esc(a.key)}">${esc(a.label)}</button>`;
+      return `<div class="sug"><span>${ic[s.lv]||"💡"}</span><span class="tx">${esc(s.t)}</span>${b}</div>`}).join("")}</div>`:"";
+  const q=AC.q.trim().toLowerCase();
+  let gs=r.groups.filter(g=>(!AC.hideSys||!g.system)&&(!q||g.label.toLowerCase().includes(q)||g.procs.some(p=>p.name.toLowerCase().includes(q))));
+  gs=gs.slice().sort((a,b)=>AC.sort==="cpu"?b.cpu-a.cpu:b.mem-a.mem);
+  const max=Math.max(1,...gs.map(g=>AC.sort==="cpu"?g.cpu:g.mem)),lim=AC.more?gs.length:50;
+  const cpu=x=>String(x).replace(".",",")+"%";
+  $("a-list").innerHTML=`<div class="card" style="padding:8px 8px 4px"><div class="ahead"><span></span><span>Ứng dụng / tiến trình (${gs.length})</span><span class="r">Tiến trình</span><span class="r">RAM</span><span class="r">CPU</span></div>
+    ${gs.slice(0,lim).map(g=>{const op=AC.open.has(g.key),bad=g.flags.some(f=>f.lv==="bad"),pct=(AC.sort==="cpu"?g.cpu:g.mem)/max*100;
+      return `<div class="arow ${op?"open":""} ${g.system?"sys":""} ${g.flags.length?"hot":""}" data-agrp="${esc(g.key)}">
+        <span class="caret">▸</span><span class="an">${esc(g.label)} ${g.system?`<span class="badge b-review" style="background:var(--alt);color:var(--muted)">hệ thống</span>`:""}
+          ${bad?`<span class="badge b-careful">bất thường</span>`:g.flags.length?`<span class="badge b-review">chú ý</span>`:""}
+          ${g.browser?`<span class="badge b-safe">trình duyệt</span>`:""}${g.owner?` <span class="mut">· mở bởi ${esc(g.owner)}</span>`:""}</span>
+        <span class="r mut">${g.n}</span><span class="r">${human(g.mem)}</span><span class="r acpu">${cpu(g.cpu)}</span>
+        <div class="abar"><div style="width:${pct.toFixed(1)}%"></div></div></div>${op?groupDetail(g):""}`}).join("")}
+    ${gs.length>lim?`<div style="padding:8px"><button class="link" id="amore">Hiện thêm ${gs.length-lim} mục</button></div>`:""}</div>`;
+}
+function groupDetail(g){
+  const risk=g.flags.some(f=>f.lv==="bad")?"careful":g.system?"safe":"review";
+  let h=`<div class="adet">${g.flags.map(f=>`<div class="aflag ${f.lv}">${f.lv==="bad"?"⛔":"⚠️"} ${esc(f.t)}</div>`).join("")}${infoBox(g.info,risk)}<div class="btns">`;
+  if(g.browser)h+=`<button class="small" data-atabs="${esc(g.key)}">🔍 Xem tab nào nặng nhất</button>`;
+  if(g.can_quit)h+=`<button class="small" data-aquit="${esc(g.key)}">Thoát ${esc(g.label)}</button><button class="small" style="background:var(--danger)" data-aquit="${esc(g.key)}" data-force="1">Buộc thoát</button>`;
+  h+=`</div>`;
+  if(g.browser&&AC.tabs[g.key])h+=tabsHTML(g);
+  h+=`<table class="mini"><tr><th>Tiến trình</th><th>Loại</th><th class="r">PID</th><th class="r">RAM</th><th class="r">CPU</th><th class="r" title="CPU trung bình từ lúc tiến trình chạy">CPU TB</th><th class="r">Đã chạy</th><th></th></tr>
+    ${g.procs.map(p=>`<tr class="${p.flags.some(f=>f.lv==="bad")?"bad":""}"><td>${esc(p.name)}${p.flags.map(f=>`<div class="mut" style="color:var(--${f.lv==="bad"?"careful":"review"})">${esc(f.t)}</div>`).join("")}</td>
+      <td class="mut">${esc(p.tlabel||(p.user!==g.procs[0].user?p.user:""))}</td><td class="num mut">${p.pid}</td>
+      <td class="num">${p.exact?"":"≈"}${human(p.mem)}</td><td class="num">${String(p.cpu).replace(".",",")}%</td><td class="num mut">${String(p.avg).replace(".",",")}%</td>
+      <td class="num mut">${dur(p.etime)}</td><td class="r">${p.killable?`<button class="link" data-akill="${p.pid}" data-aname="${esc(p.name)}">Buộc dừng</button>`:""}</td></tr>
+      ${p.info?`<tr class="pinfo"><td colspan="8">${esc(p.info.what)} ${esc(p.info.act)}</td></tr>`:""}`).join("")}</table>
+    ${g.n>g.procs.length?`<p class="mut">… và ${g.n-g.procs.length} tiến trình nhỏ hơn.</p>`:""}
+    <p class="mut" style="font-size:11.5px;word-break:break-all">${esc(g.bundle||g.procs[0].path)}</p></div>`;
+  return h;
+}
+function tabsHTML(g){
+  const t=AC.tabs[g.key];
+  if(t.loading)return `<div class="tabsbox"><span class="spin"></span>${t.measure?"Đang đo bộ nhớ từng tab (có thể mất vài chục giây)…":"Đang đọc danh sách tab…"}</div>`;
+  if(t.error)return `<div class="tabsbox"><b>${esc(t.error)}</b>${t.hint?`<p class="mut">${esc(t.hint)}</p>`:""}${t.perm?`<button class="small" style="margin-left:0" data-act="open_automation">Mở cài đặt Tự động hóa</button>`:""}</div>`;
+  const mx=Math.max(1,...t.tabs.map(x=>x.score));
+  return `<div class="tabsbox"><p style="margin:0 0 6px"><b>${t.count} tab</b> · ${esc(t.browser)} dùng tổng ${human(t.total)} qua ${t.n_renderers} tiến trình trang web${t.renderers.length?` (nặng nhất: ${t.renderers.slice(0,4).map(human).join(", ")})`:""}${t.ext_mem?` · tiện ích mở rộng ${human(t.ext_mem)}`:""}${t.gpu_mem?` · đồ họa ${human(t.gpu_mem)}`:""}.</p>
+    <p class="mut" style="margin:0 0 8px;font-size:12.5px">${t.measured?"Con số là bộ nhớ JavaScript đo trực tiếp trong từng tab: phần lớn nhất nhưng chưa gồm ảnh/video đang giải mã, nên RAM thật cao hơn một chút.":"Thứ tự theo ước tính từ loại trang (chưa đo). macOS không cho biết tab nào ứng với tiến trình nào, nên muốn số chính xác hãy bấm Đo."}
+      ${t.can_measure&&!t.measured?` <button class="link" data-ameasure="${esc(g.key)}">📏 Đo chính xác từng tab</button>`:""}${t.measured?` <button class="link" data-ameasure="${esc(g.key)}">↻ Đo lại</button>`:""}</p>
+    ${t.js_off?`<div class="aflag warn">Chưa đo được: ${esc(t.browser)} đang tắt quyền chạy JavaScript từ AppleScript. Bật bằng menu <b>Xem → Nhà phát triển → Cho phép JavaScript từ Apple Events</b> (View → Developer → Allow JavaScript from Apple Events), rồi bấm Đo lại. Spotless Mac chỉ đọc con số bộ nhớ, không đọc nội dung trang. Lưu ý: tab đang ngủ (Tiết kiệm bộ nhớ) có thể bị đánh thức khi đo.</div>`:""}
+    ${t.tabs.map((x,i)=>`<div class="tabrow ${x.close?"cl":""}"><span class="rk">${i+1}</span>
+      <div class="tt"><b>${esc(x.title||x.url||"(không tên)")}</b><span class="mut">${esc(x.host)}</span>
+        ${x.active?` <span class="badge b-safe">đang xem</span>`:""}${x.dup?` <span class="badge b-review">mở trùng</span>`:""}${x.loading?` <span class="badge b-review">đang tải</span>`:""}
+        <div class="why">${esc(x.why)}</div>${x.close?`<div class="rs">👉 Nên đóng: ${esc(x.reason)}</div>`:""}</div>
+      <div class="sz">${x.heap!=null?human(x.heap):(t.measured?`<span class="mut">chưa đo được</span>`:`~${human(x.lo)}–${human(x.hi)}`)}<div class="bar"><div style="width:${Math.max(2,x.score/mx*100).toFixed(0)}%"></div></div></div>
+      <div style="white-space:nowrap"><button class="link" data-atabact="focus" data-akey="${esc(g.key)}" data-ai="${i}">Chuyển tới</button><button class="link" style="color:var(--danger)" data-atabact="close" data-akey="${esc(g.key)}" data-ai="${i}">Đóng tab</button></div></div>`).join("")}</div>`;
+}
+async function loadTabs(key,measure){
+  const g=gkey(key);if(!g)return;
+  AC.open.add(key);AC.tabs[key]={loading:true,measure};renderActivity();
+  try{AC.tabs[key]=await api("/api/tabs",{bid:g.bid,measure})}catch(e){AC.tabs[key]={error:"Không đọc được tab."}}
+  renderActivity();
+}
+document.addEventListener("pointerdown",()=>{AC.downAt=Date.now()},true);
+document.addEventListener("input",e=>{if(e.target.id==="aq"){AC.q=e.target.value;renderActivity()}});
+document.addEventListener("change",e=>{if(e.target.id==="asys"){AC.hideSys=e.target.checked;try{localStorage.setItem("donmac.asys",AC.hideSys?"1":"0")}catch(_){}renderActivity()}});
+document.addEventListener("click",async e=>{
+  if(tab!=="activity")return;
+  const so=e.target.closest("[data-asort]");if(so){AC.sort=so.dataset.asort;try{localStorage.setItem("donmac.asort",AC.sort)}catch(_){}renderActivity();return}
+  if(e.target.closest("#apause")){AC.paused=!AC.paused;if(!AC.paused)pollActivity();renderActivity();return}
+  if(e.target.closest("#amore")){AC.more=true;renderActivity();return}
+  const k=e.target.closest("[data-akill]");
+  if(k){const pid=+k.dataset.akill,name=k.dataset.aname;let p=null;for(const g of AC.data.groups)for(const x of g.procs)if(x.pid===pid)p=x;
+    const note=p&&p.info&&p.info.close==="ok"?p.info.act:"Chương trình sẽ bị tắt ngay; dữ liệu chưa lưu trong nó sẽ mất. Nếu là tiến trình phụ của một app, phần tương ứng của app (ví dụ một tab) sẽ báo lỗi.";
+    if(!confirm(`Buộc dừng “${name}” (PID ${pid})?\n\n${note}`))return;
+    const r=await api("/api/proc_kill",{pid,name});toast(r.ok?`✅ Đã dừng ${esc(name)}`:`⚠️ ${esc(r.error||"Không dừng được")}`);pollActivity();return}
+  const qt=e.target.closest("[data-aquit]");
+  if(qt){const g=gkey(qt.dataset.aquit);if(!g)return;const force=qt.dataset.force==="1";
+    if(!confirm(force?`Buộc thoát ${g.label}?\n\nApp bị tắt ngay, dữ liệu chưa lưu sẽ mất. Chỉ dùng khi app treo hoặc không chịu thoát.`:`Thoát ${g.label}?\n\nGiống bấm ⌘Q: app sẽ hỏi lưu nếu còn tài liệu chưa lưu.`))return;
+    const r=await api("/api/app_quit",{bundle:g.bundle,force});toast(r.ok?`✅ Đã yêu cầu ${esc(g.label)} thoát`:`⚠️ ${esc(r.error||"Không thoát được")}`);setTimeout(pollActivity,1500);return}
+  const tb=e.target.closest("[data-atabs]");if(tb){loadTabs(tb.dataset.atabs,false);setTimeout(()=>{const el=document.querySelector(`[data-agrp="${CSS.escape(tb.dataset.atabs)}"]`);if(el)el.scrollIntoView({block:"start",behavior:"smooth"})},50);return}
+  const ms=e.target.closest("[data-ameasure]");if(ms){loadTabs(ms.dataset.ameasure,true);return}
+  const ta=e.target.closest("[data-atabact]");
+  if(ta){const key=ta.dataset.akey,t=AC.tabs[key],g=gkey(key),x=t&&t.tabs&&t.tabs[+ta.dataset.ai];if(!x||!g)return;
+    const r=await api("/api/tab_act",{bid:g.bid,win:x.win,id:x.id,idx:x.idx,url:x.url,action:ta.dataset.atabact});
+    if(!r.ok){toast(`⚠️ ${esc(r.error||"Không thực hiện được")}`);return}
+    if(ta.dataset.atabact==="close"){t.tabs.splice(+ta.dataset.ai,1);t.count--;
+      for(const y of t.tabs)if(y.win===x.win&&y.idx>x.idx&&!t.can_measure)y.idx--;
+      toast(`Đã đóng tab “${esc(x.title||x.host)}”. Mở lại bằng ⌘⇧T trong trình duyệt.`);renderActivity();setTimeout(pollActivity,1200)}
+    return}
+  const op=e.target.closest("[data-aopen]");if(op){AC.open.add(op.dataset.aopen);renderActivity();const el=document.querySelector(`[data-agrp="${CSS.escape(op.dataset.aopen)}"]`);if(el)el.scrollIntoView({block:"start",behavior:"smooth"});return}
+  const gr=e.target.closest("[data-agrp]");if(gr){const k2=gr.dataset.agrp;AC.open.has(k2)?AC.open.delete(k2):AC.open.add(k2);renderActivity();return}
+});
+
 /* ================= 003: Máy & cài đặt ================= */
 const dur=s=>{if(s==null)return"—";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+" ngày ":"")+(h?h+" giờ ":"")+m+" phút"};
 const when=t=>t?new Date(t*1000).toLocaleString("vi-VN"):"";
@@ -3669,7 +4627,7 @@ document.addEventListener("change",e=>{
   if(t.dataset.catbox){for(const i of items)if(i.cat===t.dataset.catbox)t.checked?selected.add(i.id):selected.delete(i.id);renderSuggest()}
 });
 document.addEventListener("keydown",e=>{
-  if(tab==="suggest"||tab==="tools"||tab==="machine"||e.target.matches("input,textarea,select"))return;
+  if(tab==="suggest"||tab==="tools"||tab==="machine"||tab==="activity"||e.target.matches("input,textarea,select"))return;
   const meta=e.metaKey||e.ctrlKey, t=cur();
   if(meta&&(e.key==="Backspace"||e.key==="Delete")){e.preventDefault();if(!$("go").disabled)deleteSelected();return}
   if(meta&&e.key.toLowerCase()==="a"){e.preventDefault();t.sel=new Set(visibleOrder().filter(x=>x.deletable).map(x=>x.id));paintSel();return}
@@ -3691,7 +4649,7 @@ setInterval(()=>{if(!dead)api("/api/ping",{}).catch(()=>{})},20000);
 addEventListener("pagehide",()=>{try{navigator.sendBeacon("/api/bye?t="+TOKEN)}catch(e){}});
 addEventListener("pageshow",e=>{if(e.persisted&&!dead)api("/api/ping",{}).catch(()=>{})});
 refresh();
-try{const sv=localStorage.getItem("donmac.tool");if(sv&&TL[sv])tool=sv;const saved=localStorage.getItem("donmac.tab");if(saved&&saved!=="suggest"&&(T[saved]||saved==="tools"||saved==="machine"))setTab(saved)}catch(e){}
+try{const sv=localStorage.getItem("donmac.tool");if(sv&&TL[sv])tool=sv;const saved=localStorage.getItem("donmac.tab");if(saved&&saved!=="suggest"&&(T[saved]||saved==="tools"||saved==="machine"||saved==="activity"))setTab(saved)}catch(e){}
 </script>
 </body>
 </html>

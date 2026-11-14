@@ -1,0 +1,65 @@
+// Kiểm thử tab Hoạt động (004): FAKE_HOME=/tmp/fha node tests/ui_activity.js (HOME giả có thể rỗng)
+const {chromium} = require('playwright');
+const {spawn} = require('child_process');
+const path = require('path'), fs = require('fs');
+const OUT = path.join(__dirname, 'out'); fs.mkdirSync(OUT, {recursive: true});
+const HOME = process.env.FAKE_HOME || '/tmp/fha'; fs.mkdirSync(HOME, {recursive: true});
+const fail = m => { console.error('❌ ' + m); process.exit(1); };
+const ok = m => console.log('✓ ' + m);
+(async () => {
+  const srv = spawn('python3', [path.join(__dirname, 'act_harness.py'), '--native'], {env: {...process.env, HOME}, stdio: ['pipe', 'pipe', 'inherit']});
+  const url = await new Promise(r => srv.stdout.on('data', d => { const m = String(d).match(/DONMAC_URL (\S+)/); if (m) r(m[1]); }));
+  const b = await chromium.launch();
+  for (const scheme of ['light', 'dark']) {
+    const p = await b.newPage({viewport: {width: 1240, height: 900}, colorScheme: scheme, deviceScaleFactor: 2});
+    const errs = []; p.on('pageerror', e => errs.push(e.message));
+    p.on('dialog', d => d.accept());
+    await p.goto(url);
+    await p.click('[data-tab=activity]');
+    await p.waitForSelector('#a-list .arow', {timeout: 30000});
+    const sum = await p.$eval('#a-sum', x => x.textContent);
+    if (!sum.includes('Áp lực bộ nhớ') || !sum.includes('Cao')) fail('thiếu áp lực bộ nhớ: ' + sum); ok('thẻ RAM có áp lực bộ nhớ');
+    const sug = await p.$eval('#a-sug', x => x.textContent);
+    if (scheme === 'light' && (!sug.includes('chrome_crashpad_handler') || !sug.includes('bị kẹt'))) fail('gợi ý thiếu crashpad'); ok('gợi ý nêu crashpad bị kẹt');
+    const first = await p.$eval('#a-list .arow .an', x => x.textContent);
+    if (!first.includes('Claude')) fail('dòng đầu theo RAM phải là Claude: ' + first); ok('sắp theo RAM, Claude đứng đầu');
+    if (scheme === 'light') {
+      await p.click('[data-asort=cpu]'); ok('đổi sang Theo CPU');
+      await p.click('[data-asort=mem]');
+      await p.click('#a-sug [data-atabs]');
+      await p.waitForSelector('.tabsbox .tabrow', {timeout: 20000});
+      const rows = await p.$$eval('.tabsbox .tabrow', r => r.map(x => x.textContent));
+      if (rows.length !== 4) fail('phải có 4 tab, thực tế ' + rows.length);
+      if (!rows[0].includes('Figma') && !rows[0].includes('YouTube')) fail('tab nặng nhất ước tính sai: ' + rows[0]);
+      if (!(await p.$eval('.tabsbox', x => x.textContent)).includes('Nên đóng')) fail('thiếu gợi ý Nên đóng'); ok('Xem tab: 4 tab, xếp hạng, có Nên đóng');
+      await p.screenshot({path: `${OUT}/activity-tabs.png`, fullPage: true});
+      await p.click('[data-ameasure]');
+      await p.waitForFunction(() => document.querySelector('.tabsbox') && document.querySelector('.tabsbox').textContent.includes('đo trực tiếp'), null, {timeout: 20000});
+      const top = await p.$eval('.tabsbox .tabrow', x => x.textContent);
+      if (!top.includes('YouTube') || !top.includes('MB')) fail('đo chính xác: tab đầu phải là YouTube 300 MB: ' + top); ok('Đo chính xác: YouTube nặng nhất');
+      await p.click('.tabsbox [data-atabact=close] >> nth=0');
+      await p.waitForFunction(() => document.querySelectorAll('.tabsbox .tabrow').length === 3);
+      ok('Đóng tab → còn 3 tab');
+      // Buộc dừng crashpad (tiến trình thật)
+      await p.click('#a-sug [data-akill]');
+      await p.waitForFunction(() => !document.querySelector('#a-sug').textContent.includes('crashpad'), null, {timeout: 15000});
+      ok('Buộc dừng crashpad → hết cảnh báo');
+      const sysRows = await p.$$eval('#a-list .arow.sys', r => r.length);
+      await p.check('#asys');
+      const after = await p.$$eval('#a-list .arow.sys', r => r.length);
+      if (!(sysRows > 0 && after === 0)) fail('ẩn hệ thống không chạy'); ok('Ẩn tiến trình hệ thống');
+      await p.uncheck('#asys');
+      await p.fill('#aq', 'node');
+      if ((await p.$$eval('#a-list .arow', r => r.length)) !== 1) fail('tìm kiếm sai'); ok('tìm kiếm lọc đúng');
+      await p.fill('#aq', '');
+      await p.click('#a-list .arow:has-text("WindowServer")');
+      const det = await p.$eval('.arow:has-text("WindowServer") + .adet', x => x.textContent);
+      if (!det.includes('Vì sao tốn RAM/CPU') || !det.includes('Nên đóng khi nào') || det.includes('Buộc dừng')) fail('chi tiết WindowServer sai: ' + det);
+      ok('WindowServer: có giải thích, không cho buộc dừng');
+    }
+    await p.screenshot({path: `${OUT}/activity-${scheme}.png`, fullPage: true});
+    if (errs.length) fail('lỗi JS: ' + errs.join(' | ')); ok(`không có lỗi JS (${scheme})`);
+    await p.close();
+  }
+  await b.close(); srv.kill(); console.log('UI ACTIVITY PASSED'); process.exit(0);
+})().catch(e => fail(e.stack));

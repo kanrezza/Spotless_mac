@@ -30,6 +30,7 @@ Chạy thử không cần cài: `python3 src/don_mac.py`.
 | **Công cụ → Ảnh giống** | Ảnh trông giống nhau (băm cảm nhận qua `sips`), chỉ để bạn tự chọn; có ô chọn cả nhóm và nút “Chọn tất cả trừ ảnh lớn nhất mỗi nhóm”. |
 | **Công cụ → Dấu vết AI** | File thừa của Claude Code, Claude Desktop, Codex, ChatGPT: phiên bản cũ sau mỗi lần tự cập nhật, transcript/nhật ký/ảnh cũ theo số ngày, máy ảo Cowork, cache của app. File cấu hình, đăng nhập, `CLAUDE.md` và `memory/` không bao giờ bị đụng tới. |
 | Nên xóa khi nào | Mọi lời khuyên có thêm mục “🕒 Nên xóa khi nào”; thư mục Electron/Chromium quen thuộc (CertificateRevocation, Crashpad, ShaderCache…) được giải thích cụ thể |
+| **Hoạt động** | Như Giám sát hoạt động nhưng có giải thích: app/tiến trình nào ngốn RAM, CPU nhiều nhất (gom helper về app chủ), Áp lực bộ nhớ, phát hiện tiến trình bị kẹt (ví dụ `crashpad_handler` ăn 100%+ CPU), vì sao tốn và nên đóng khi nào. Với Brave/Chrome/Edge/Arc/Safari: liệt kê tab, xếp hạng tab nặng nhất (ước tính hoặc đo chính xác), chuyển tới hoặc đóng tab ngay. Không bao giờ cho buộc dừng tiến trình hệ thống. |
 | **Máy & cài đặt** | Dọn tự động theo lịch, danh sách **Luôn giữ**, lịch sử dọn dẹp, trạng thái máy, mục tự khởi động, bảo mật cơ bản (chỉ xem). |
 
 ### Dòng lệnh
@@ -56,6 +57,8 @@ Chạy được trên Linux hoặc macOS với thư mục nhà giả (cần Node
 python3 tests/make_fake_home.py /tmp/fh
 HOME=/tmp/fh python3 tests/test_core.py
 HOME=/tmp/fh python3 tests/test_advice.py
+python3 tests/test_activity.py
+FAKE_HOME=/tmp/fha node tests/ui_activity.js
 HOME=/tmp/fh python3 tests/test_tools.py
 node tests/ui_smoke.js                                   # đặt FAKE_HOME=/tmp/fh
 python3 tests/seed_tools_home.py /tmp/fh3 && FAKE_HOME=/tmp/fh3 node tests/ui_tools.js
