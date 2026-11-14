@@ -31,6 +31,7 @@ Chạy thử không cần cài: `python3 src/don_mac.py`.
 | **Công cụ → Dấu vết AI** | File thừa của Claude Code, Claude Desktop, Codex, ChatGPT: phiên bản cũ sau mỗi lần tự cập nhật, transcript/nhật ký/ảnh cũ theo số ngày, máy ảo Cowork, cache của app. File cấu hình, đăng nhập, `CLAUDE.md` và `memory/` không bao giờ bị đụng tới. |
 | Nên xóa khi nào | Mọi lời khuyên có thêm mục “🕒 Nên xóa khi nào”; thư mục Electron/Chromium quen thuộc (CertificateRevocation, Crashpad, ShaderCache…) được giải thích cụ thể |
 | **Hoạt động** | Như Giám sát hoạt động nhưng có giải thích: app/tiến trình nào ngốn RAM, CPU nhiều nhất (gom helper về app chủ), Áp lực bộ nhớ, phát hiện tiến trình bị kẹt (ví dụ `crashpad_handler` ăn 100%+ CPU), vì sao tốn và nên đóng khi nào. Với Brave/Chrome/Edge/Arc/Safari: liệt kê tab, xếp hạng tab nặng nhất (ước tính hoặc đo chính xác), chuyển tới hoặc đóng tab ngay. Không bao giờ cho buộc dừng tiến trình hệ thống. |
+| **Pin & tối ưu** | Pin & sạc (củ sạc cấp bao nhiêu W so với máy đang dùng, cảnh báo pin tụt khi cắm sạc, app tốn điện nhất theo “Tác động năng lượng”, sức khỏe pin); Kiểm tra nhanh (Tiết kiệm bộ nhớ/tăng tốc phần cứng/chạy nền của Brave–Chrome–Edge, tiện ích nặng hoặc thừa, app chạy từ Tải về, Chế độ nguồn điện thấp, nên khởi động lại); Khởi động cùng máy (tắt/bật LaunchAgent có sao lưu, bỏ/thêm app mở khi đăng nhập); Theo dõi nền mỗi phút (báo tiến trình kẹt, tự buộc dừng crashpad, pin tụt, thiếu RAM) và biểu tượng trên thanh menu; Lịch sử ổ đĩa/RAM/pin, dự báo ngày đầy ổ, ổ đầy vì đâu, đã dọn theo tuần. |
 | **Máy & cài đặt** | Dọn tự động theo lịch, danh sách **Luôn giữ**, lịch sử dọn dẹp, trạng thái máy, mục tự khởi động, bảo mật cơ bản (chỉ xem). |
 
 ### Dòng lệnh
@@ -59,6 +60,8 @@ HOME=/tmp/fh python3 tests/test_core.py
 HOME=/tmp/fh python3 tests/test_advice.py
 python3 tests/test_activity.py
 FAKE_HOME=/tmp/fha node tests/ui_activity.js
+HOME=/tmp/fho python3 tests/test_optim.py
+FAKE_HOME=/tmp/fhp node tests/ui_optim.js
 HOME=/tmp/fh python3 tests/test_tools.py
 node tests/ui_smoke.js                                   # đặt FAKE_HOME=/tmp/fh
 python3 tests/seed_tools_home.py /tmp/fh3 && FAKE_HOME=/tmp/fh3 node tests/ui_tools.js

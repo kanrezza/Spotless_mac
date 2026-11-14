@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.3.1"
+VERSION = "6.0.0"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -131,7 +131,13 @@ TABS = {"big": [], "downloads": []}
 DIRSIZE = {}
 DIR_PENDING = set()
 SIZE_POOL = ThreadPoolExecutor(max_workers=4)
-THUMB_DIR = tempfile.mkdtemp(prefix="donmac-thumbs-")
+_THUMB = [None]
+
+
+def thumb_dir():
+    if not _THUMB[0]:
+        _THUMB[0] = tempfile.mkdtemp(prefix="donmac-thumbs-")
+    return _THUMB[0]
 QL_PROC = [None]
 LAST_PING = [time.time()]
 BYE_AT = [0.0]
@@ -974,12 +980,12 @@ def browse(eid):
 
 def thumb_for(e, size=1024):
     """Hình thu nhỏ do Quick Look tạo (research R1); None nếu không có."""
-    out = os.path.join(THUMB_DIR, f"{e['id']}-{size}.png")
+    out = os.path.join(thumb_dir(), f"{e['id']}-{size}.png")
     if os.path.exists(out):
         return out
     if not shutil.which("qlmanage") or not os.path.exists(e["path"]):
         return None
-    tmp = tempfile.mkdtemp(dir=THUMB_DIR)
+    tmp = tempfile.mkdtemp(dir=thumb_dir())
     run(["qlmanage", "-t", "-s", str(size), "-o", tmp, e["path"]], 20)
     made = [os.path.join(tmp, n) for n in listdir(tmp) if n.endswith(".png")]
     if made:
@@ -1398,6 +1404,7 @@ def run_scan():
         ITEMS.update({i["id"]: i for i in items})
         STATE.update(running=False, step="", items=items, warnings=warn, scanned_at=time.time(),
                      need_fda=any("Toàn quyền" in w for w in warn))
+    record_scan(items)
 
 
 def start_scan():
@@ -2092,7 +2099,7 @@ def bmp_dhash(data):
 def image_hash(path):
     if not SIPS:
         return None
-    tmp = os.path.join(THUMB_DIR, "h_" + uuid.uuid4().hex[:10] + ".bmp")
+    tmp = os.path.join(thumb_dir(), "h_" + uuid.uuid4().hex[:10] + ".bmp")
     try:
         r = run([SIPS, "-z", "9", "9", "-s", "format", "bmp", path, "--out", tmp], 30)
         if not r or r.returncode != 0:
@@ -3037,6 +3044,10 @@ def activity():
     mem = mem_summary()
     groups = proc_snapshot(mem=mem)
     ncpu = os.cpu_count() or 1
+    try:
+        record_metric(mem=mem)
+    except Exception:
+        pass
     return {"mem": mem, "groups": groups, "suggest": activity_suggest(groups, mem), "ncpu": ncpu,
             "cpu": round(min(100.0, sum(g["cpu"] for g in groups) / ncpu), 1), "t": time.time()}
 
@@ -3595,6 +3606,1002 @@ def schedule_set(enabled, min_mb=200, weekday=0, hour=10):
     return schedule_get()
 
 
+# ------------------------------------------------------------------ 005: Pin & sạc, theo dõi nền, khởi động, kiểm tra, lịch sử
+WATCH_LABEL = "local.donmac.watch"
+MENU_LABEL = "local.donmac.menu"
+_CACHE = {}
+
+
+def cached(key, ttl, fn):
+    hit = _CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    v = fn()
+    _CACHE[key] = (time.time(), v)
+    return v
+
+
+def _signed(v):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return v - 2 ** 64 if v >= 2 ** 63 else v
+
+
+def ioreg_battery(text=None):
+    """Đọc AppleSmartBattery (ioreg -a: plist XML). None nếu máy không có pin hoặc không đọc được."""
+    if text is None:
+        r = run(["ioreg", "-rn", "AppleSmartBattery", "-a"], 10)
+        text = r.stdout if r and r.returncode == 0 else ""
+    if not text.strip():
+        return None
+    try:
+        arr = plistlib.loads(text.encode("utf-8"))
+    except Exception:
+        return None
+    b = arr[0] if isinstance(arr, list) and arr else arr
+    return b if isinstance(b, dict) else None
+
+
+def hw_model():
+    def f():
+        out = sh(["system_profiler", "SPHardwareDataType", "-json"], 20)
+        try:
+            h = json.loads(out)["SPHardwareDataType"][0]
+            return {"name": h.get("machine_name", ""), "model": h.get("machine_model", ""), "chip": h.get("chip_type", "")}
+        except Exception:
+            return {"name": "", "model": sh(["sysctl", "-n", "hw.model"]).strip(), "chip": ""}
+    return cached("hw", 3600, f)
+
+
+def sp_power():
+    """Sức khỏe pin theo system_profiler (giống mục Pin trong Thông tin hệ thống)."""
+    def f():
+        out = sh(["system_profiler", "SPPowerDataType", "-json"], 20)
+        flat = {}
+
+        def walk(x):
+            if isinstance(x, dict):
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+                    else:
+                        flat.setdefault(k, v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+        try:
+            walk(json.loads(out))
+        except Exception:
+            return {}
+        res = {}
+        for k, v in flat.items():
+            kl = k.lower()
+            if "maximum_capacity" in kl:
+                m = re.search(r"\d+", str(v))
+                res["max_pct"] = int(m.group(0)) if m else None
+            elif kl.endswith("cycle_count"):
+                res["cycles"] = v
+            elif kl.endswith("battery_health") and "maximum" not in kl:
+                res["condition"] = str(v)
+            elif "watts" in kl:
+                res["watts"] = v
+        return res
+    return cached("sppower", 120, f)
+
+
+def charger_advice(hw, watts):
+    name = (hw or {}).get("name", "").lower()
+    rec, fast = (30, 70) if "air" in name else ((67, 96) if "pro" in name else (30, 65))
+    if "pro" in name and "16" in (hw or {}).get("model", ""):
+        rec, fast = 140, 140
+    if not watts:
+        return rec, ""
+    if watts < rec:
+        return rec, (f"Củ sạc {watts:.0f}W yếu hơn mức Apple đi kèm máy này ({rec}W). Khi mở nhiều app máy dùng nhiều hơn {watts:.0f}W "
+                     f"nên pin sạc chậm hoặc tụt. Nên dùng củ USB‑C PD từ {rec}W trở lên.")
+    if watts < fast:
+        return rec, (f"Củ {watts:.0f}W đủ dùng. Khi tải rất nặng (máy ảo, build, nhiều tab video) máy có thể dùng sát {watts:.0f}W nên pin lên chậm; "
+                     f"củ {fast}W sẽ dư sức và sạc nhanh hơn.")
+    return rec, f"Củ {watts:.0f}W dư sức cho máy này."
+
+
+def battery_info(ioreg_text=None, pmset_text=None, light=False):
+    b = ioreg_battery(ioreg_text)
+    if not b:
+        return None
+    mx = b.get("MaxCapacity") or 100
+    pct = round((b.get("CurrentCapacity") or 0) / mx * 100) if mx else None
+    volt = (b.get("Voltage") or b.get("AppleRawBatteryVoltage") or 0) / 1000
+    amp = _signed(b.get("InstantAmperage", b.get("Amperage", 0))) / 1000
+    batt_w = round(volt * amp, 1)
+    tel = b.get("PowerTelemetryData") or {}
+    load = tel.get("SystemLoad")
+    pin = tel.get("SystemPowerIn")
+    ad = b.get("AdapterDetails") or {}
+    connected = bool(b.get("ExternalConnected"))
+    adapter_w = ad.get("Watts") or 0
+    sys_w = round(load / 1000, 1) if load else None
+    in_w = round(pin / 1000, 1) if pin else None
+    if sys_w is None:
+        sys_w = round(in_w - batt_w, 1) if (connected and in_w) else (round(-batt_w, 1) if not connected else None)
+    temp = b.get("Temperature") or (b.get("BatteryData") or {}).get("Temperature")
+    temp = round(temp / 100, 1) if isinstance(temp, (int, float)) and temp > 200 else temp
+    design = b.get("DesignCapacity") or 0
+    rawmax = b.get("NominalChargeCapacity") or b.get("AppleRawMaxCapacity") or 0
+    sp = sp_power() if (ioreg_text is None and not light) else {}
+    health = sp.get("max_pct") or (round(rawmax / design * 100) if design and rawmax else None)
+    pm = pmset_text if pmset_text is not None else ("" if light else sh(["pmset", "-g", "batt"]))
+    tte = b.get("AvgTimeToEmpty") or b.get("TimeRemaining")
+    ttf = b.get("AvgTimeToFull")
+    charging = bool(b.get("IsCharging"))
+    full = bool(b.get("FullyCharged"))
+    info = {"pct": pct, "connected": connected, "charging": charging, "full": full, "batt_w": batt_w, "sys_w": sys_w,
+            "in_w": in_w, "adapter_w": adapter_w, "adapter": ad.get("Name") or ad.get("Description") or "",
+            "temp": temp, "cycles": b.get("CycleCount") or sp.get("cycles"), "health": health,
+            "condition": sp.get("condition") or "", "design_mah": design, "max_mah": rawmax,
+            "tte": tte if isinstance(tte, int) and 0 < tte < 65535 else None,
+            "ttf": ttf if isinstance(ttf, int) and 0 < ttf < 65535 else None,
+            "hold": "on hold" in pm or "not charging" in pm}
+    info.update(battery_verdict(info))
+    info["verdict"] = re.sub(r"(\d)\.(\d)", r"\1,\2", info["verdict"])
+    return info
+
+
+def battery_verdict(i):
+    """Câu kết luận + mức (ok/warn/bad/info) cho tình trạng sạc."""
+    sw = i.get("sys_w")
+    use = f"máy đang dùng khoảng {sw:.0f}W" if sw else "máy đang dùng nhiều điện"
+    aw = i.get("adapter_w") or 0
+    if not i["connected"]:
+        left = f", còn khoảng {i['tte'] // 60} giờ {i['tte'] % 60} phút" if i.get("tte") else ""
+        return {"lv": "info", "verdict": f"Đang chạy bằng pin: {use}{left}."}
+    if i["batt_w"] <= -0.5:
+        return {"lv": "bad", "verdict": f"Pin đang TỤT dù cắm sạc ({i['batt_w']:.1f}W): {use}, nhiều hơn củ sạc"
+                                       + (f" {aw}W" if aw else "") + " cấp được. Đóng bớt app tốn điện bên dưới, hoặc dùng củ sạc mạnh hơn."}
+    if i["full"] or (i["pct"] or 0) >= 100:
+        return {"lv": "ok", "verdict": f"Pin đầy, máy chạy thẳng bằng điện sạc ({use})."}
+    if not i["charging"] or i["batt_w"] < 0.3:
+        if i.get("temp") and i["temp"] >= 35:
+            return {"lv": "warn", "verdict": f"Tạm dừng sạc vì pin nóng ({i['temp']:.0f}°C). macOS sẽ sạc lại khi pin nguội; kê máy thoáng, đóng app nặng."}
+        if 75 <= (i["pct"] or 0) <= 85:
+            return {"lv": "ok", "verdict": "Đang giữ pin quanh 80% (Sạc pin tối ưu hoặc giới hạn sạc của macOS) để pin bền hơn. Bình thường, "
+                                           "macOS sẽ sạc đầy trước giờ bạn hay rút sạc."}
+        return {"lv": "warn", "verdict": f"Đang cắm sạc nhưng pin không lên: {use}, vừa bằng mức củ sạc cấp. Đóng bớt app tốn điện để pin lên."}
+    if i["batt_w"] < 5 and (i["pct"] or 0) < 90:
+        return {"lv": "warn", "verdict": f"Sạc chậm: chỉ {i['batt_w']:.1f}W vào pin vì {use}"
+                                        + (f" trên củ {aw}W" if aw else "") + "."}
+    eta = f", đầy sau khoảng {i['ttf'] // 60} giờ {i['ttf'] % 60} phút" if i.get("ttf") else ""
+    return {"lv": "ok", "verdict": f"Đang sạc tốt: {i['batt_w']:.1f}W vào pin{eta}."}
+
+
+def parse_top_power(text):
+    """`top -l 2 -stats pid,power,command`: lấy mẫu thứ hai (mẫu đầu luôn bằng 0)."""
+    lines = text.splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.strip().startswith("PID")]
+    if not starts:
+        return {}
+    out = {}
+    for ln in lines[starts[-1] + 1:]:
+        p = ln.split(None, 2)
+        if len(p) < 2:
+            continue
+        pid = re.sub(r"\D", "", p[0])
+        try:
+            out[int(pid)] = float(p[1].replace(",", "."))
+        except ValueError:
+            continue
+    return out
+
+
+def energy_apps(groups=None, top_text=None):
+    if top_text is None:
+        try:
+            r = subprocess.run(["top", "-l", "2", "-s", "1", "-n", "40", "-o", "power", "-stats", "pid,power,command"],
+                               capture_output=True, text=True, timeout=15, env=dict(os.environ, LC_ALL="C"))
+            top_text = r.stdout if r.returncode == 0 else ""
+        except Exception:
+            top_text = ""
+    pw = parse_top_power(top_text)
+    groups = groups if groups is not None else proc_snapshot()
+    out = []
+    for g in groups:
+        e = sum(pw.get(p["pid"], 0) for p in g["procs"])
+        if e >= 0.5:
+            tip = g["info"]["act"]
+            if g["browser"]:
+                tip = ("Tab video/phim và trang mạng xã hội tốn điện nhất. Đóng tab không xem (nút Xem tab ở tab Hoạt động), "
+                       "tắt Chế độ môi trường của YouTube, dùng tiện ích chặn AV1 trên máy M1/M2.")
+            out.append({"key": g["key"], "label": g["label"], "energy": round(e, 1), "cpu": g["cpu"], "mem": g["mem"],
+                        "system": g["system"], "verdict": g["verdict"], "tip": tip,
+                        "stuck": any(f["lv"] == "bad" for f in g["flags"])})
+    out.sort(key=lambda x: -x["energy"])
+    return out[:15]
+
+
+def power_page():
+    b = battery_info()
+    hw = hw_model() if sys.platform == "darwin" else {}
+    rec, cadv = charger_advice(hw, (b or {}).get("adapter_w"))
+    pm = sh(["pmset", "-g"])
+    m = re.search(r"lowpowermode\s+(\d)", pm)
+    groups = proc_snapshot(mem=None)
+    apps = energy_apps(groups)
+    tips = []
+    if b and b["lv"] in ("bad", "warn") and apps:
+        heavy = [a for a in apps if not a["system"]][:3]
+        if heavy:
+            tips.append("Tốn điện nhất lúc này: " + ", ".join(f"{a['label']} ({a['energy']:.0f})" for a in heavy) + ".")
+    if any(a["stuck"] for a in apps):
+        tips.append("Có tiến trình bị kẹt đang đốt CPU: buộc dừng nó ở tab Hoạt động là giảm điện ngay.")
+    return {"battery": b, "hw": hw, "charger_rec": rec, "charger_advice": cadv, "low_power": (m.group(1) == "1") if m else None,
+            "apps": apps, "tips": tips, "t": time.time()}
+
+
+# ---- thông báo + theo dõi nền
+def notify(text, title="Spotless Mac", subtitle=""):
+    if sys.platform != "darwin":
+        return
+    s = f"display notification {aq(text)} with title {aq(title)}" + (f" subtitle {aq(subtitle)}" if subtitle else "")
+    run(["osascript", "-e", s], 15)
+
+
+def watch_cfg():
+    w = load_cfg().get("watch")
+    d = {"enabled": False, "stuck": True, "auto_kill": False, "battery": True, "pressure": True, "metrics": True,
+         "cpu": 90, "minutes": 5, "menu": False}
+    if isinstance(w, dict):
+        d.update({k: w[k] for k in d if k in w})
+    return d
+
+
+def wpath(name):
+    return os.path.join(DATA_DIR, name)
+
+
+def read_json(p, default):
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, d):
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
+def watch_log(kind, text):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(wpath("watch.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": time.time(), "kind": kind, "text": text}, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def read_jsonl(name, limit=1000):
+    try:
+        with open(wpath(name), "r", encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            pass
+    return out
+
+
+def record_metric(mem=None, batt=None, force=False):
+    """Ghi một mẫu (ổ đĩa, RAM, pin) tối đa mỗi 30 phút vào metrics.jsonl; giữ 60 ngày."""
+    st = read_json(wpath("metrics_state.json"), {})
+    now = time.time()
+    if not force and now - st.get("last", 0) < 1700:
+        return False
+    try:
+        d = shutil.disk_usage(HOME)
+    except OSError:
+        return False
+    mem = mem if mem is not None else mem_summary()
+    batt = batt if batt is not None else battery_info(light=True)
+    row = {"t": int(now), "free": d.free, "total": d.total}
+    if mem:
+        row.update(mem_used=mem["used"], mem_total=mem["total"], pressure=mem["pressure"], swap=mem["swap_used"], comp=mem["compressed"])
+    if batt:
+        row.update(batt=batt.get("pct"), sys_w=batt.get("sys_w"), plugged=batt.get("connected"))
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        p = wpath("metrics.jsonl")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        if os.path.getsize(p) > 1_500_000:
+            keep = [r for r in read_jsonl("metrics.jsonl", 100000) if r.get("t", 0) > now - 60 * 86400]
+            with open(p, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(r) + "\n" for r in keep)
+    except OSError:
+        return False
+    st["last"] = now
+    write_json(wpath("metrics_state.json"), st)
+    return True
+
+
+def record_scan(items):
+    """Sau mỗi lần quét: lưu dung lượng từng nhóm Đề xuất để biết lần sau ổ đầy lên vì đâu."""
+    cats = {}
+    for i in items:
+        cats[i["cat"]] = cats.get(i["cat"], 0) + (i.get("size") or 0)
+    try:
+        d = shutil.disk_usage(HOME)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(wpath("scans.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": int(time.time()), "free": d.free, "cats": cats}) + "\n")
+    except OSError:
+        pass
+
+
+def watch_once(now=None, ps_main=None, batt=None, level=None):
+    """Một lượt theo dõi nền (LaunchAgent gọi mỗi phút). Trả về danh sách sự kiện (để kiểm thử)."""
+    cfg = watch_cfg()
+    now = now or time.time()
+    st = read_json(wpath("watch_state.json"), {})
+    prev_t = st.get("t")
+    dt = now - prev_t if prev_t else 0
+    events = []
+    me = me_user()
+    rows = [r for r in parse_ps(ps_main if ps_main is not None else ps_text("pid=,ppid=,uid=,rss=,pcpu=,etime=,time=,comm="))
+            if r["user"] == me]
+    procs_prev = st.get("procs", {})
+    procs = {}
+    mins = max(1, int(cfg["minutes"]))
+    for r in rows:
+        k, name = str(r["pid"]), os.path.basename(r["path"])
+        low = name.lower()
+        pv = procs_prev.get(k)
+        if pv and pv.get("name") != name:
+            pv = None
+        cpu = max(0.0, (r["cputime"] - pv["ct"]) / dt * 100) if (pv and 20 <= dt <= 600) else r["cpu"]
+        crash = low in CRASH_PROCS
+        high = cpu >= (20 if crash else float(cfg["cpu"]))
+        rec = {"name": name, "ct": r["cputime"], "high": ((pv or {}).get("high") or now) if high else None,
+               "noted": (pv or {}).get("noted", 0), "cpu": round(cpu)}
+        if high and now - rec["high"] >= mins * 60 - 5 and now - rec["noted"] >= 1800 and cfg["stuck"]:
+            lasted = max(1, int((now - rec["high"]) / 60))
+            if crash and cfg["auto_kill"]:
+                res = proc_kill(r["pid"], name)
+                txt = (f"Đã tự buộc dừng {name} (ăn {cpu:.0f}% CPU suốt {lasted} phút). App chủ vẫn chạy bình thường."
+                       if res.get("ok") else f"{name} ăn {cpu:.0f}% CPU suốt {lasted} phút nhưng không buộc dừng được: {res.get('error')}")
+                events.append(("kill" if res.get("ok") else "stuck", txt))
+            else:
+                txt = f"{name} ăn {cpu:.0f}% CPU suốt {lasted} phút" + (" (bị kẹt, buộc dừng là an toàn)." if crash else ".") \
+                    + " Mở Spotless Mac → Hoạt động để xử lý."
+                events.append(("stuck", txt))
+            rec["noted"] = now
+        if high or r["cpu"] >= 15 or now - rec["noted"] < 3600:
+            procs[k] = rec
+    st["procs"] = procs
+    b = batt if batt is not None else (battery_info(light=True) if cfg["battery"] or cfg["metrics"] else None)
+    if cfg["battery"] and b and b["connected"] and b["batt_w"] <= -0.5:
+        st["drain"] = st.get("drain") or now
+        if now - st["drain"] >= mins * 60 - 5 and now - st.get("drain_noted", 0) >= 3600:
+            events.append(("battery", f"Pin đang tụt dù cắm sạc: máy dùng khoảng {b['sys_w'] or 0:.0f}W, nhiều hơn củ sạc "
+                                      f"{b['adapter_w'] or '?'}W cấp được. Mở Spotless Mac → Pin & tối ưu để xem app nào tốn điện."))
+            st["drain_noted"] = now
+    else:
+        st["drain"] = None
+    lv = level if level is not None else sh(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip()
+    if cfg["pressure"] and str(lv) in ("2", "4"):
+        st["press"] = st.get("press") or now
+        if now - st["press"] >= mins * 60 - 5 and now - st.get("press_noted", 0) >= 7200:
+            top = sorted(rows, key=lambda r: -r["rss"])[:2]
+            names = ", ".join(os.path.basename(r["path"]) for r in top)
+            events.append(("pressure", f"Máy thiếu RAM (áp lực {'đỏ' if str(lv) == '4' else 'vàng'}) đã {mins} phút. Nặng nhất: {names}."))
+            st["press_noted"] = now
+    else:
+        st["press"] = None
+    st["t"] = now
+    write_json(wpath("watch_state.json"), st)
+    for kind, txt in events:
+        watch_log(kind, txt)
+        notify(txt, subtitle={"kill": "Đã xử lý tiến trình kẹt", "stuck": "Tiến trình bị kẹt", "battery": "Pin & sạc",
+                              "pressure": "Thiếu RAM"}.get(kind, ""))
+    if cfg["metrics"]:
+        record_metric(batt=b)
+    return events
+
+
+def agent_path(label):
+    return os.path.join(HOME, "Library/LaunchAgents", label + ".plist")
+
+
+def script_path():
+    p = os.path.join(DATA_DIR, "don_mac.py")
+    return p if os.path.exists(p) else os.path.realpath(__file__)
+
+
+def agent_set(label, plist):
+    """Cài (plist != None) hoặc gỡ LaunchAgent của Spotless Mac."""
+    if sys.platform != "darwin":
+        return False
+    target = f"gui/{os.getuid()}"
+    run(["launchctl", "bootout", f"{target}/{label}"], 20)
+    p = agent_path(label)
+    if plist is None:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        return True
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "wb") as f:
+        plistlib.dump(plist, f)
+    r = run(["launchctl", "bootstrap", target, p], 20)
+    return bool(r and r.returncode == 0)
+
+
+def watch_set(**kw):
+    cfg = load_cfg()
+    w = watch_cfg()
+    for k in ("enabled", "stuck", "auto_kill", "battery", "pressure", "metrics"):
+        if k in kw:
+            w[k] = bool(kw[k])
+    if "cpu" in kw:
+        w["cpu"] = max(30, min(400, int(kw["cpu"])))
+    if "minutes" in kw:
+        w["minutes"] = max(1, min(60, int(kw["minutes"])))
+    cfg["watch"] = w
+    save_cfg(cfg)
+    log = os.path.join(HOME, "Library/Logs/DonMac-watch.log")
+    agent_set(WATCH_LABEL, {"Label": WATCH_LABEL, "ProgramArguments": [sys.executable, script_path(), "--watch"],
+                            "StartInterval": 60, "RunAtLoad": True, "ProcessType": "Background", "LowPriorityIO": True,
+                            "Nice": 10, "StandardErrorPath": log, "StandardOutPath": log} if w["enabled"] else None)
+    return watch_get()
+
+
+def watch_get():
+    w = watch_cfg()
+    w["installed"] = os.path.exists(agent_path(WATCH_LABEL))
+    w["menu_installed"] = os.path.exists(agent_path(MENU_LABEL))
+    w["menu_bin"] = os.path.exists(wpath("SpotlessMenu"))
+    w["log"] = list(reversed(read_jsonl("watch.jsonl", 60)))
+    w["darwin"] = sys.platform == "darwin"
+    return w
+
+
+# ---- thanh menu (app phụ Swift riêng: lỗi biên dịch không ảnh hưởng app chính)
+MENU_SWIFT = r"""
+import Cocoa
+
+final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    var item: NSStatusItem!
+    var data: [String: Any] = [:]
+    let py: String
+    let script: String
+
+    init(py: String, script: String) {
+        self.py = py
+        self.script = script
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.title = "◌"
+        let menu = NSMenu()
+        menu.delegate = self
+        item.menu = menu
+        refresh()
+        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    func runPy(_ args: [String], done: @escaping (Data) -> Void) {
+        let py = self.py
+        let script = self.script
+        DispatchQueue.global(qos: .utility).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: py)
+            p.arguments = [script] + args
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            do {
+                try p.run()
+            } catch {
+                return
+            }
+            let d = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            DispatchQueue.main.async {
+                done(d)
+            }
+        }
+    }
+
+    func refresh() {
+        runPy(["--mini"]) { d in
+            if let j = (try? JSONSerialization.jsonObject(with: d, options: [])) as? [String: Any] {
+                self.data = j
+                self.item.button?.title = (j["title"] as? String) ?? "◌"
+            }
+        }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let lines = (data["lines"] as? [String]) ?? ["Đang đọc…"]
+        for line in lines {
+            let it = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            menu.addItem(it)
+        }
+        let actions = (data["actions"] as? [[String: String]]) ?? []
+        if !actions.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+        for a in actions {
+            let it = NSMenuItem(title: a["title"] ?? "", action: #selector(doAction(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = a["arg"] ?? ""
+            menu.addItem(it)
+        }
+        menu.addItem(NSMenuItem.separator())
+        let o = NSMenuItem(title: "Mở Spotless Mac", action: #selector(openApp), keyEquivalent: "")
+        o.target = self
+        menu.addItem(o)
+        let r = NSMenuItem(title: "Làm mới", action: #selector(reload), keyEquivalent: "")
+        r.target = self
+        menu.addItem(r)
+        let q = NSMenuItem(title: "Ẩn biểu tượng này", action: #selector(hideMenu), keyEquivalent: "")
+        q.target = self
+        menu.addItem(q)
+    }
+
+    @objc func doAction(_ sender: NSMenuItem) {
+        guard let arg = sender.representedObject as? String else { return }
+        runPy(["--mini-act", arg]) { _ in
+            self.refresh()
+        }
+    }
+
+    @objc func reload() {
+        refresh()
+    }
+
+    @objc func openApp() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-b", "local.donmac.app"]
+        try? p.run()
+    }
+
+    @objc func hideMenu() {
+        runPy(["--menu-off"]) { _ in
+            NSApp.terminate(nil)
+        }
+    }
+}
+
+let argv = CommandLine.arguments
+let app = NSApplication.shared
+let delegate = MenuApp(py: argv.count > 1 ? argv[1] : "/usr/bin/python3", script: argv.count > 2 ? argv[2] : "")
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()
+"""
+
+
+def mini_status(groups=None, mem=None, batt=None):
+    """Dữ liệu cho biểu tượng thanh menu: tiêu đề ngắn, vài dòng tóm tắt, hành động nhanh."""
+    mem = mem if mem is not None else mem_summary()
+    batt = batt if batt is not None else battery_info(light=True)
+    groups = groups if groups is not None else proc_snapshot(mem=mem)
+    ncpu = os.cpu_count() or 1
+    cpu = min(100.0, sum(g["cpu"] for g in groups) / ncpu)
+    stuck = [(p, g) for g in groups for p in g["procs"] if any(f["lv"] == "bad" for f in p["flags"]) and p["killable"]]
+    dot = {"normal": "●", "warn": "◐", "critical": "◉"}.get((mem or {}).get("pressure", "normal"), "●")
+    title = f"{dot} {cpu:.0f}%"
+    if stuck:
+        title = "⚠︎ " + title
+    if batt and batt["connected"] and batt["batt_w"] <= -0.5:
+        title += " ⚡︎"
+    lines = []
+    if mem:
+        lines.append(f"RAM: {hd(mem['used'])} / {hd(mem['total'])} · áp lực "
+                     + {"normal": "bình thường", "warn": "cao", "critical": "quá tải"}[mem["pressure"]])
+    lines.append(f"CPU: {cpu:.0f}% ({ncpu} nhân)")
+    if batt:
+        lines.append(f"Pin {batt['pct']}% · " + batt["verdict"][:90])
+    top = [g for g in groups if not g["system"]][:3]
+    if top:
+        lines.append("Nặng nhất: " + ", ".join(f"{g['label']} {hd(g['mem'])}" for g in top))
+    actions = [{"title": f"Buộc dừng {p['name']} (đang {p['cpu']:.0f}% CPU)", "arg": f"kill:{p['pid']}:{p['name']}"} for p, g in stuck[:3]]
+    return {"title": title, "lines": lines, "actions": actions}
+
+
+def mini_act(arg):
+    if arg.startswith("kill:"):
+        _, pid, name = arg.split(":", 2)
+        r = proc_kill(pid, name)
+        notify(f"Đã buộc dừng {name}." if r.get("ok") else f"Không buộc dừng được {name}: {r.get('error')}")
+        return r
+    return {"ok": False}
+
+
+def menu_set(enabled):
+    cfg = load_cfg()
+    w = watch_cfg()
+    w["menu"] = bool(enabled)
+    cfg["watch"] = w
+    save_cfg(cfg)
+    if not enabled:
+        agent_set(MENU_LABEL, None)
+        run(["pkill", "-f", "DonMac/SpotlessMenu"], 10)
+        return {"ok": True, **watch_get()}
+    exe = wpath("SpotlessMenu")
+    sig = hashlib_sha(MENU_SWIFT)
+    if not (os.path.exists(exe) and read_json(wpath("menu_build.json"), {}).get("sig") == sig):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix="donmac-menu-")
+        src = os.path.join(tmp, "menu.swift")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(MENU_SWIFT)
+        r = run(["xcrun", "swiftc", "-O", "-swift-version", "5", src, "-o", exe, "-framework", "Cocoa"], 600)
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not (r and r.returncode == 0 and os.path.exists(exe)):
+            w["menu"] = False
+            cfg["watch"] = w
+            save_cfg(cfg)
+            err = (r.stderr.strip()[-600:] if r else "") or "Không chạy được swiftc (cần Command Line Tools: xcode-select --install)."
+            return {"ok": False, "error": "Không biên dịch được biểu tượng thanh menu.", "detail": err, **watch_get()}
+        run(["codesign", "--force", "--sign", "-", exe], 60)
+        write_json(wpath("menu_build.json"), {"sig": sig})
+    ok = agent_set(MENU_LABEL, {"Label": MENU_LABEL, "ProgramArguments": [exe, sys.executable, script_path()],
+                                "RunAtLoad": True, "LimitLoadToSessionType": "Aqua", "ProcessType": "Interactive"})
+    return {"ok": ok, **watch_get()}
+
+
+def hashlib_sha(s):
+    import hashlib
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+# ---- mục tự khởi động: tắt/bật được (chỉ LaunchAgent của người dùng), có sao lưu để hoàn tác
+KNOWN_AGENTS = [
+    (r"keystone|googleupdater|com\.google\.(keystone|updater|googleupdater)", "Trình cập nhật Google (Chrome, Drive…)",
+     "Tự kiểm tra cập nhật Chrome/Google mỗi vài giờ.", "Tắt được; Chrome vẫn tự cập nhật khi bạn mở nó."),
+    (r"brave", "Trình cập nhật Brave", "Kiểm tra cập nhật Brave chạy nền.", "Tắt được; Brave tự cập nhật khi mở."),
+    (r"microsoft\.(update|autoupdate)|msupdate|com\.microsoft\.office\.licensing", "Microsoft AutoUpdate",
+     "Cập nhật Office/Teams/Edge chạy nền.", "Tắt được; mở app Microsoft vẫn tự cập nhật."),
+    (r"adobe", "Dịch vụ nền của Adobe", "Creative Cloud, cập nhật, đồng bộ phông chữ.", "Tắt nếu ít dùng Adobe; mở Creative Cloud sẽ bật lại."),
+    (r"zoom|us\.zoom", "Zoom", "Trình cập nhật/daemon của Zoom.", "Tắt được nếu ít họp."),
+    (r"orbstack|dev\.kdrag0n", "OrbStack", "Khởi động máy ảo Docker/Linux cùng máy.", "Tắt nếu không cần Docker mỗi lần mở máy: tiết kiệm 1–4 GB RAM."),
+    (r"docker", "Docker Desktop", "Khởi động Docker cùng máy.", "Tắt nếu không cần Docker mỗi lần mở máy."),
+    (r"cloudflare", "Cloudflare WARP", "VPN WARP chạy cùng máy.", "Tắt nếu bạn chỉ thỉnh thoảng bật VPN."),
+    (r"homebrew\.mxcl\.", "Dịch vụ Homebrew (brew services)", "Database/dịch vụ (Postgres, Redis, MySQL…) chạy nền mãi.",
+     "Tắt bằng: brew services stop <tên>. Chỉ bật khi đang làm project cần nó."),
+    (r"spotify", "Spotify", "Mở Spotify cùng máy.", "Tắt được."),
+    (r"dropbox|onedrive|googledrive|com\.google\.drivefs", "Đồng bộ đám mây", "Đồng bộ file chạy nền.", "Giữ nếu bạn cần file luôn đồng bộ."),
+    (r"teamviewer|anydesk|ultraviewer", "Điều khiển từ xa", "Cho phép người khác điều khiển máy từ xa.", "Tắt nếu không dùng: an toàn hơn."),
+    (r"jetbrains|toolbox", "JetBrains Toolbox", "Quản lý IDE JetBrains.", "Tắt được."),
+    (r"local\.donmac\.", "Spotless Mac", "Tác vụ nền của chính Spotless Mac.", "Bật/tắt trong tab Pin & tối ưu → Theo dõi nền."),
+]
+
+
+def agent_explain(label, prog):
+    s = f"{label} {prog or ''}".lower()
+    for pat, name, what, adv in KNOWN_AGENTS:
+        if re.search(pat, s):
+            return {"name": name, "what": what, "advice": adv}
+    return {"name": "", "what": "Chương trình chạy nền do một app cài.", "advice": "Tắt nếu bạn nhận ra và không cần nó chạy cùng máy; bật lại được."}
+
+
+def disabled_dir():
+    return wpath("disabled_agents")
+
+
+def startup_manage():
+    rows = []
+    me_agents = os.path.join(HOME, "Library/LaunchAgents")
+    for x in startup_items():
+        user = x["where"] == home_short(me_agents)
+        e = agent_explain(x["label"], x["program"])
+        ours = x["label"].startswith("local.donmac.")
+        rows.append(dict(x, scope="user" if user else "system", can_toggle=user and not ours, enabled=True, **e))
+    for n in listdir(disabled_dir()):
+        if n.endswith(".plist"):
+            p = os.path.join(disabled_dir(), n)
+            try:
+                with open(p, "rb") as f:
+                    pl = plistlib.load(f)
+            except Exception:
+                continue
+            prog = pl.get("Program") or (pl.get("ProgramArguments") or [None])[0]
+            rows.append(dict({"id": None, "label": pl.get("Label") or n[:-6], "file": n, "where": "Đã tắt bởi Spotless Mac",
+                              "program": prog, "run_at_load": bool(pl.get("RunAtLoad")), "broken": False},
+                             scope="user", can_toggle=True, enabled=False, **agent_explain(pl.get("Label") or n, prog)))
+    return {"agents": rows, "login": login_items()}
+
+
+def agent_toggle(file, enable):
+    if not re.fullmatch(r"[\w.\-]+\.plist", file or "") or file.startswith("local.donmac."):
+        return {"ok": False, "error": "Mục không hợp lệ."}
+    src_dir = os.path.join(HOME, "Library/LaunchAgents")
+    on, off = os.path.join(src_dir, file), os.path.join(disabled_dir(), file)
+    target = f"gui/{os.getuid()}"
+    if enable:
+        if not os.path.exists(off):
+            return {"ok": False, "error": "Không tìm thấy bản sao lưu."}
+        if os.path.exists(on):
+            return {"ok": False, "error": "Đã có mục cùng tên đang bật."}
+        shutil.move(off, on)
+        run(["launchctl", "bootstrap", target, on], 20)
+        return {"ok": True}
+    if not os.path.exists(on):
+        return {"ok": False, "error": "Không tìm thấy mục."}
+    os.makedirs(disabled_dir(), exist_ok=True)
+    run(["launchctl", "bootout", target, on], 20)
+    shutil.move(on, off)
+    return {"ok": True}
+
+
+def login_items():
+    if sys.platform != "darwin":
+        return {"items": [], "error": ""}
+    r = run(["osascript", "-e", 'set US to character id 31\ntell application "System Events"\nset out to ""\n'
+             'repeat with li in login items\ntry\nset out to out & (name of li) & US & (path of li) & linefeed\nend try\nend repeat\nreturn out\nend tell'], 20)
+    if not r or r.returncode != 0:
+        err = (r.stderr if r else "") or ""
+        return {"items": [], "error": "Chưa được phép đọc danh sách mở khi đăng nhập (cần cho phép Spotless Mac điều khiển System Events)."
+                if "-1743" in err else ("Không đọc được." if err else "")}
+    items = []
+    for ln in r.stdout.splitlines():
+        if US in ln:
+            n, p = ln.split(US, 1)
+            items.append({"name": n, "path": p, **agent_explain(n, p)})
+    removed = load_cfg().get("removed_login", [])
+    return {"items": items, "removed": removed if isinstance(removed, list) else [], "error": ""}
+
+
+def login_toggle(name, path, enable):
+    if not name:
+        return {"ok": False}
+    cfg = load_cfg()
+    removed = [x for x in cfg.get("removed_login", []) if isinstance(x, dict)]
+    if enable:
+        x = next((x for x in removed if x["name"] == name), None)
+        if not x:
+            return {"ok": False, "error": "Không có thông tin để bật lại."}
+        r = run(["osascript", "-e", f'tell application "System Events" to make login item at end with properties '
+                 f'{{path:{aq(x["path"])}, hidden:false}}'], 20)
+        if r and r.returncode == 0:
+            cfg["removed_login"] = [y for y in removed if y["name"] != name]
+            save_cfg(cfg)
+            return {"ok": True}
+        return {"ok": False, "error": "Không bật lại được."}
+    r = run(["osascript", "-e", f'tell application "System Events" to delete login item {aq(name)}'], 20)
+    if r and r.returncode == 0:
+        removed.append({"name": name, "path": path, "t": time.time()})
+        cfg["removed_login"] = removed
+        save_cfg(cfg)
+        return {"ok": True}
+    return {"ok": False, "error": "Không tắt được (cần cho phép Spotless Mac điều khiển System Events)."}
+
+
+# ---- kiểm tra cài đặt tiết kiệm
+CHROMIUM_DATA = [("Brave", "BraveSoftware/Brave-Browser", "brave"), ("Chrome", "Google/Chrome", "chrome"),
+                 ("Edge", "Microsoft Edge", "edge")]
+HEAVY_EXT = re.compile(r"grammarly|honey|loom|dark ?reader|google translate|wappalyzer|react developer|redux|vue\.js devtools|"
+                       r"capital one|rakuten|monica|merlin|sider|maxai|tampermonkey", re.I)
+ADBLOCK_EXT = re.compile(r"adblock|ublock|adguard|ghostery|privacy badger", re.I)
+
+
+def _ext_name(d):
+    """Tên tiện ích từ manifest (kể cả dạng __MSG_appName__)."""
+    vers = sorted(listdir(d))
+    if not vers:
+        return None
+    root = os.path.join(d, vers[-1])
+    m = read_json(os.path.join(root, "manifest.json"), {})
+    n = m.get("name") or ""
+    mm = re.fullmatch(r"__MSG_(\w+)__", n)
+    if mm:
+        key = mm.group(1).lower()
+        for loc in (m.get("default_locale") or "en", "vi", "en", "en_US"):
+            msgs = read_json(os.path.join(root, "_locales", loc, "messages.json"), {})
+            for k, v in msgs.items():
+                if k.lower() == key and isinstance(v, dict):
+                    return v.get("message")
+    return n or None
+
+
+def browser_checks(base=None):
+    out = []
+    base = base or os.path.join(HOME, "Library/Application Support")
+    for name, rel, key in CHROMIUM_DATA:
+        root = os.path.join(base, rel)
+        ls = read_json(os.path.join(root, "Local State"), None)
+        if ls is None:
+            continue
+        pt = ls.get("performance_tuning") or {}
+        hem = (pt.get("high_efficiency_mode") or {})
+        st = hem.get("state", hem.get("enabled"))
+        if st in (0, False):
+            out.append({"id": f"{key}-memsaver", "lv": "warn", "title": f"{name}: Tiết kiệm bộ nhớ đang tắt",
+                        "text": "Tab bạn không xem vẫn giữ nguyên RAM. Bật lên thì tab lâu không dùng tự ngủ, bấm vào là tải lại.",
+                        "fix": f"{name} → Cài đặt → Hệ thống (hoặc Hiệu suất) → bật Tiết kiệm bộ nhớ (Memory Saver)."})
+        elif st is None:
+            out.append({"id": f"{key}-memsaver", "lv": "info", "title": f"{name}: kiểm tra Tiết kiệm bộ nhớ",
+                        "text": "Không đọc được trạng thái (thường là cài đặt mặc định).",
+                        "fix": f"{name} → Cài đặt → Hệ thống/Hiệu suất → bật Tiết kiệm bộ nhớ (Memory Saver)."})
+        else:
+            out.append({"id": f"{key}-memsaver", "lv": "ok", "title": f"{name}: Tiết kiệm bộ nhớ đang bật", "text": "Tab lâu không dùng sẽ tự ngủ.", "fix": ""})
+        if (ls.get("hardware_acceleration_mode") or {}).get("enabled") is False:
+            out.append({"id": f"{key}-hw", "lv": "bad", "title": f"{name}: tắt tăng tốc phần cứng",
+                        "text": "Video và hiệu ứng trang phải xử lý bằng CPU: rất tốn pin và nóng máy.",
+                        "fix": f"{name} → Cài đặt → Hệ thống → bật “Sử dụng tăng tốc đồ họa khi có”, rồi khởi động lại {name}."})
+        if (ls.get("background_mode") or {}).get("enabled") is True:
+            out.append({"id": f"{key}-bg", "lv": "warn", "title": f"{name}: vẫn chạy nền sau khi đóng cửa sổ",
+                        "text": f"Đóng hết cửa sổ nhưng {name} vẫn chạy (tiện ích, thông báo), tiếp tục tốn RAM và pin.",
+                        "fix": f"{name} → Cài đặt → Hệ thống → tắt “Tiếp tục chạy ứng dụng nền khi đóng {name}”."})
+        exts = {}
+        for prof in [p for p in listdir(root) if p == "Default" or p.startswith("Profile ")]:
+            ed = os.path.join(root, prof, "Extensions")
+            for eid in listdir(ed):
+                if eid.startswith(".") or eid == "Temp":
+                    continue
+                n = _ext_name(os.path.join(ed, eid))
+                if n and not n.startswith("__"):
+                    exts[eid] = n
+        names = sorted(set(exts.values()), key=str.lower)
+        heavy = [n for n in names if HEAVY_EXT.search(n)]
+        ads = [n for n in names if ADBLOCK_EXT.search(n)]
+        lv = "warn" if len(names) >= 12 or heavy or (key == "brave" and ads) or len(ads) > 1 else "ok"
+        txt = f"{len(names)} tiện ích: " + ", ".join(names[:20]) + ("…" if len(names) > 20 else "") if names else "Không có tiện ích nào."
+        notes = []
+        if heavy:
+            notes.append("Tiện ích hay tốn tài nguyên: " + ", ".join(heavy) + ".")
+        if key == "brave" and ads:
+            notes.append("Brave Shields đã chặn quảng cáo sẵn nên " + ", ".join(ads) + " là thừa.")
+        elif len(ads) > 1:
+            notes.append("Đang dùng nhiều tiện ích chặn quảng cáo cùng lúc: chỉ cần một.")
+        if len(names) >= 12:
+            notes.append("Mỗi tiện ích chạy tiến trình riêng; gỡ cái không dùng.")
+        out.append({"id": f"{key}-ext", "lv": lv, "title": f"{name}: tiện ích mở rộng", "text": txt + (" " + " ".join(notes) if notes else ""),
+                    "fix": f"Gõ {key}://extensions vào thanh địa chỉ để tắt/gỡ." if lv != "ok" else ""})
+    return out
+
+
+def find_original_app(name):
+    for base in (os.path.join(HOME, "Downloads"), os.path.join(HOME, "Desktop")):
+        for root, dirs, _ in os.walk(base):
+            if root.count(os.sep) - base.count(os.sep) > 2:
+                dirs[:] = []
+                continue
+            if name + ".app" in dirs:
+                return os.path.join(root, name + ".app")
+            dirs[:] = [d for d in dirs if not d.endswith(".app")]
+    return None
+
+
+def opt_checks(groups=None):
+    checks = []
+    groups = groups if groups is not None else proc_snapshot()
+    seen = set()
+    for g in groups:
+        b = g.get("bundle") or ""
+        if "/AppTranslocation/" in b and g["label"] not in seen:
+            seen.add(g["label"])
+            orig = find_original_app(os.path.basename(b)[:-4])
+            checks.append({"id": "transloc-" + g["label"], "lv": "warn", "title": f"{g['label']} đang chạy thẳng từ thư mục Tải về",
+                           "text": "macOS chạy bản sao tạm (App Translocation) nên app không tự cập nhật được, mở chậm hơn và hay bị hỏi quyền lại.",
+                           "fix": "Thoát app, kéo nó vào thư mục Ứng dụng, rồi mở lại từ đó.",
+                           "action": {"kind": "move_app", "src": orig, "label": "Chuyển vào Ứng dụng"} if orig else None})
+    for base in (os.path.join(HOME, "Downloads"), os.path.join(HOME, "Desktop")):
+        for n in listdir(base):
+            if n.endswith(".app") and n[:-4] not in seen and os.path.isdir(os.path.join(base, n)):
+                seen.add(n[:-4])
+                checks.append({"id": "dlapp-" + n, "lv": "info", "title": f"{n[:-4]} đang nằm trong {home_short(base)}",
+                               "text": "App để ngoài thư mục Ứng dụng sẽ chạy dạng bản sao tạm, không tự cập nhật.",
+                               "fix": "Chuyển vào thư mục Ứng dụng (hoặc xóa nếu đã có bản trong đó).",
+                               "action": {"kind": "move_app", "src": os.path.join(base, n), "label": "Chuyển vào Ứng dụng"}})
+    checks += browser_checks()
+    pm = sh(["pmset", "-g"])
+    m = re.search(r"lowpowermode\s+(\d)", pm)
+    if m:
+        on = m.group(1) == "1"
+        checks.append({"id": "lowpower", "lv": "ok" if on else "info", "title": "Chế độ nguồn điện thấp " + ("đang bật" if on else "đang tắt"),
+                       "text": "Giảm xung CPU và độ sáng để mát máy, pin lâu hơn; hầu như không thấy chậm khi duyệt web, xem phim, soạn thảo.",
+                       "fix": "" if on else "Cài đặt hệ thống → Pin → Chế độ nguồn điện thấp → “Khi chạy bằng pin” (hoặc “Luôn luôn” khi sạc yếu).",
+                       "action": None if on else {"kind": "open", "url": "x-apple.systempreferences:com.apple.preference.battery", "label": "Mở cài đặt Pin"}})
+    mi = machine_info() if sys.platform == "darwin" else {}
+    mem = mem_summary()
+    up = mi.get("uptime") or 0
+    if up > 10 * 86400 and mem and mem["swap_used"] > 3 * GB:
+        checks.append({"id": "restart", "lv": "warn", "title": f"Máy đã chạy {up // 86400} ngày chưa khởi động lại",
+                       "text": f"Swap đang {hd(mem['swap_used'])} và bộ nhớ bị phân mảnh dần. Khởi động lại sẽ dọn sạch swap, tiến trình kẹt và RAM rò rỉ.",
+                       "fix": "Lưu công việc rồi khởi động lại máy (menu  → Khởi động lại)."})
+    n_agents = len([x for x in startup_items() if not x["label"].startswith("local.donmac.")])
+    if n_agents >= 8:
+        checks.append({"id": "agents", "lv": "info", "title": f"{n_agents} chương trình chạy nền cùng máy",
+                       "text": "Nhiều updater/dịch vụ chạy nền làm máy khởi động chậm và tốn pin.",
+                       "fix": "Xem và tắt bớt ở mục “Khởi động cùng máy”.", "action": {"kind": "sub", "sub": "startup", "label": "Xem"}})
+    order = {"bad": 0, "warn": 1, "info": 2, "ok": 3}
+    checks.sort(key=lambda c: order.get(c["lv"], 9))
+    return checks
+
+
+def move_app(src):
+    if not src or not src.endswith(".app") or not os.path.isdir(src) or not src.startswith(HOME + "/") \
+            or not any(src.startswith(os.path.join(HOME, d) + "/") for d in ("Downloads", "Desktop")):
+        return {"ok": False, "error": "Không chuyển được app này."}
+    dest = os.path.join("/Applications", os.path.basename(src))
+    if os.path.exists(dest):
+        return {"ok": False, "error": f"Đã có {os.path.basename(src)} trong thư mục Ứng dụng. Mở bản trong Ứng dụng và xóa bản ở Tải về."}
+    running = [r for r in parse_ps(ps_text("pid=,ppid=,uid=,rss=,pcpu=,etime=,time=,comm="))
+               if "/AppTranslocation/" in r["path"] and "/" + os.path.basename(src) + "/" in r["path"]]
+    if running:
+        return {"ok": False, "error": f"Hãy thoát {os.path.basename(src)[:-4]} trước (⌘Q), rồi bấm lại."}
+    try:
+        shutil.move(src, dest)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    run(["xattr", "-dr", "com.apple.quarantine", dest], 30)
+    return {"ok": True, "dest": dest}
+
+
+# ---- lịch sử ổ đĩa / RAM / pin
+def downsample(rows, n=400):
+    if len(rows) <= n:
+        return rows
+    step = len(rows) / n
+    return [rows[int(i * step)] for i in range(n)]
+
+
+def trends(days=30):
+    now = time.time()
+    rows = [r for r in read_jsonl("metrics.jsonl", 100000) if r.get("t", 0) >= now - days * 86400]
+    rows.sort(key=lambda r: r["t"])
+    proj = None
+    week = [r for r in rows if r["t"] >= now - 7 * 86400]
+    if len(week) >= 4 and week[-1]["t"] - week[0]["t"] >= 86400:
+        xs = [r["t"] / 86400 for r in week]
+        ys = [r["free"] for r in week]
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        den = sum((x - mx) ** 2 for x in xs) or 1
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den  # byte/ngày
+        proj = {"per_day": slope, "days_left": (week[-1]["free"] / -slope) if slope < -50 * MB else None}
+    scans = read_jsonl("scans.jsonl", 50)
+    growth = []
+    if len(scans) >= 2:
+        a, b = scans[-2], scans[-1]
+        for k in set(a.get("cats", {})) | set(b.get("cats", {})):
+            dlt = b.get("cats", {}).get(k, 0) - a.get("cats", {}).get(k, 0)
+            if abs(dlt) >= 100 * MB:
+                growth.append({"cat": k, "title": next((t for c, t, _ in CATEGORIES if c == k), k), "delta": dlt})
+        growth.sort(key=lambda x: -x["delta"])
+    weeks = {}
+    for h in read_history(100000):
+        if h.get("mode") == "x" or not h.get("t"):
+            continue
+        wk = time.strftime("%Y-%W", time.localtime(h["t"]))
+        w = weeks.setdefault(wk, {"week": wk, "size": 0, "n": 0, "t": h["t"]})
+        w["size"] += h.get("size") or 0
+        w["n"] += 1
+        w["t"] = min(w["t"], h["t"])
+    return {"metrics": downsample(rows), "proj": proj, "scans": scans[-10:], "growth": growth,
+            "last_scan_pair": [scans[-2]["t"], scans[-1]["t"]] if len(scans) >= 2 else None,
+            "freed": sorted(weeks.values(), key=lambda w: w["week"])[-12:], "now": now}
+
+
 # ------------------------------------------------------------------ web
 class Handler(BaseHTTPRequestHandler):
     server_version = "DonMac/" + VERSION
@@ -3696,6 +4703,22 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._json({"error": "forbidden"}, 403)
             self._json({"machine": machine_info(), "security": security_info(), "startup": startup_items()})
+        elif self.path in ("/api/power", "/api/checks", "/api/startup", "/api/watch") or self.path.startswith("/api/trends"):
+            if not self._authed():
+                return self._json({"error": "forbidden"}, 403)
+            if self.path == "/api/power":
+                return self._json(power_page())
+            if self.path == "/api/checks":
+                return self._json({"checks": opt_checks()})
+            if self.path == "/api/startup":
+                return self._json(startup_manage())
+            if self.path == "/api/watch":
+                return self._json(watch_get())
+            try:
+                days = int(self._query().get("days", "7"))
+            except ValueError:
+                days = 7
+            return self._json(trends(max(1, min(days, 60))))
         elif self.path == "/api/activity":
             if not self._authed():
                 return self._json({"error": "forbidden"}, 403)
@@ -3805,6 +4828,22 @@ class Handler(BaseHTTPRequestHandler):
                                   body.get("idx"), str(body.get("url", "")), str(body.get("action", ""))))
         elif path == "/api/tabs_close":
             self._json(tabs_close_many(str(body.get("bid", "")), list(body.get("tabs", []))))
+        elif path == "/api/watch_set":
+            self._json(watch_set(**{k: v for k, v in body.items() if k in ("enabled", "stuck", "auto_kill", "battery", "pressure",
+                                                                         "metrics", "cpu", "minutes")}))
+        elif path == "/api/menu_set":
+            self._json(menu_set(bool(body.get("enabled"))))
+        elif path == "/api/agent_toggle":
+            self._json(agent_toggle(str(body.get("file", "")), bool(body.get("enable"))))
+        elif path == "/api/login_toggle":
+            self._json(login_toggle(str(body.get("name", "")), str(body.get("path", "")), bool(body.get("enable"))))
+        elif path == "/api/move_app":
+            self._json(move_app(str(body.get("src", ""))))
+        elif path == "/api/open_url":
+            u = str(body.get("url", ""))
+            if u.startswith("x-apple.systempreferences:"):
+                run(["open", u], 10)
+            self._json({"ok": True})
         elif path == "/api/open_automation":
             run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"], 10)
             self._json({"ok": True})
@@ -3949,6 +4988,17 @@ button.badge:hover{filter:brightness(.95)}
 .verd{border-radius:10px;padding:8px 12px;margin:6px 0 8px;font-size:13px;background:var(--alt)}.verd .badge{margin-right:6px}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}.chips span{background:var(--alt);border-radius:12px;padding:3px 10px;font-size:12px}
 .trend{font-size:11px;margin-left:4px}.trend.up{color:var(--careful)}.trend.dn{color:var(--safe)}
+.pflow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:10px;align-items:center;margin:10px 0}
+.pflow .bx{background:var(--alt);border-radius:10px;padding:10px 12px;text-align:center}.pflow .bx b{display:block;font-size:20px}
+.pflow .ar{color:var(--muted);font-size:20px}.bigpct{font-size:30px;font-weight:700;margin-right:10px}
+.ock{display:grid;grid-template-columns:14px 1fr auto;gap:10px;padding:10px 0;border-top:1px solid var(--line);align-items:start}.ock:first-of-type{border-top:0}
+.ock .dot{margin-top:6px}.ock p{margin:2px 0;font-size:13px}.ock .fx{color:var(--muted);font-size:12.5px}
+.wopt{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;font-size:13px;margin:8px 0}
+.wopt input[type=number]{width:70px;font:inherit;padding:3px 6px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--text)}
+.chart{width:100%;height:auto;display:block}.chart .ln{fill:none;stroke-width:2}.chart text{font-size:11px;fill:var(--muted)}
+.chart .gr{stroke:var(--line);stroke-width:1}.wbars{display:flex;gap:6px;align-items:flex-end;height:120px;margin-top:8px}
+.wbars div{flex:1;background:var(--accent);border-radius:4px 4px 0 0;min-height:2px;position:relative}
+.wbars span{position:absolute;bottom:-18px;left:50%;transform:translateX(-50%);font-size:10.5px;color:var(--muted);white-space:nowrap}
 .atools{align-items:center}.atools input[type=search]{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text);min-width:220px}
 .amem{display:flex;height:12px;border-radius:6px;overflow:hidden;background:var(--line);margin:8px 0 6px}
 .amem>div{height:100%}.c-app{background:#0a84ff}.c-wired{background:#ff9f0a}.c-comp{background:#bf5af2}
@@ -4010,7 +5060,7 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
 .subseg{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 14px}
 .subseg button{background:var(--card);border-radius:18px;padding:5px 14px;font-weight:500}
 .subseg button.on{background:var(--accent);color:#fff}
-#v-tools,#v-machine,#v-activity{overflow:auto;padding-bottom:24px}
+#v-tools,#v-machine,#v-activity,#v-optim{overflow:auto;padding-bottom:24px}
 .tinfo{margin-bottom:12px}.tinfo h2{margin:0 0 3px;font-size:17px}.tinfo p{margin:0;color:var(--muted)}
 .tbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 12px;background:var(--card);border-radius:12px;padding:10px 12px}
 .tbar .sum{font-weight:600;margin:0 6px}.tbar .grow{margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
@@ -4048,6 +5098,7 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
     <button data-tab="browse">Trình duyệt tệp</button>
     <button data-tab="tools">Công cụ</button>
     <button data-tab="activity">Hoạt động</button>
+    <button data-tab="optim">Pin &amp; tối ưu</button>
     <button data-tab="machine">Máy &amp; cài đặt</button>
   </div>
 </div>
@@ -4082,6 +5133,16 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
       <button id="apause" style="margin-left:auto">⏸ Tạm dừng</button>
     </div>
     <div id="a-sum"></div><div id="a-sug"></div><div id="a-list"></div>
+  </div>
+  <div class="view" id="v-optim">
+    <div class="subseg" id="osub">
+      <button data-osub="power">🔋 Pin &amp; sạc</button>
+      <button data-osub="checks">✅ Kiểm tra nhanh</button>
+      <button data-osub="startup">🚀 Khởi động cùng máy</button>
+      <button data-osub="watch">👀 Theo dõi nền &amp; thanh menu</button>
+      <button data-osub="trends">📈 Lịch sử</button>
+    </div>
+    <div id="o-body"></div>
   </div>
   <div class="view" id="v-machine">
     <div id="m-sched"></div><div id="m-keep"></div><div id="m-hist"></div>
@@ -4346,7 +5407,7 @@ function renderPreview(){
 function pvThumbFail(){const b=this.parentNode;if(!b)return;const e=selEntries()[0];
   b.style.height="120px";b.innerHTML=`<div class="big" style="font-size:48px">${e?icon(e):"📄"}</div><div class="note">Không có bản xem trước</div>`}
 function renderFoot(){
-  if(tab==="tools"||tab==="machine"||tab==="activity")return;
+  if(tab==="tools"||tab==="machine"||tab==="activity"||tab==="optim")return;
   const tableTab=tab!=="suggest";
   $("reveal").style.display=$("tglPv").style.display=tableTab?"":"none";
   if(!tableTab){
@@ -4376,15 +5437,17 @@ function moveSel(d){
 }
 function setTab(name){
   tab=name; for(const b of document.querySelectorAll("#tabs button"))b.classList.toggle("on",b.dataset.tab===name);
-  const isTool=name==="tools",isMach=name==="machine",isAct=name==="activity";
-  $("v-suggest").classList.toggle("on",name==="suggest"); $("v-table").classList.toggle("on",!isTool&&!isMach&&!isAct&&name!=="suggest");
+  const isTool=name==="tools",isMach=name==="machine",isAct=name==="activity",isOpt=name==="optim";
+  $("v-suggest").classList.toggle("on",name==="suggest"); $("v-table").classList.toggle("on",!isTool&&!isMach&&!isAct&&!isOpt&&name!=="suggest");
   $("v-tools").classList.toggle("on",isTool); $("v-machine").classList.toggle("on",isMach); $("v-activity").classList.toggle("on",isAct);
-  document.querySelector(".foot").style.display=(isTool||isMach||isAct)?"none":"";
+  $("v-optim").classList.toggle("on",isOpt);
+  document.querySelector(".foot").style.display=(isTool||isMach||isAct||isOpt)?"none":"";
   try{localStorage.setItem("donmac.tab",name)}catch(e){}
   pvFor=null;
   if(isTool){setTool(tool);return}
   if(isMach){loadMachine();return}
   if(isAct){loadActivity();return}
+  if(isOpt){setOsub(OP.sub);return}
   if(name==="suggest"){renderSuggest();renderFoot();return}
   renderTable(); if(!T[name].loaded||name==="browse")loadTab(name);
   $("tbody").focus();
@@ -4724,6 +5787,171 @@ document.addEventListener("click",async e=>{
   const gr=e.target.closest("[data-agrp]");if(gr){const k2=gr.dataset.agrp;AC.open.has(k2)?AC.open.delete(k2):AC.open.add(k2);renderActivity();return}
 });
 
+/* ================= 005: Pin & tối ưu ================= */
+const OP={sub:"power",timer:null,power:null,checks:null,startup:null,watch:null,trends:null,days:7,menuBusy:false};
+try{OP.sub=localStorage.getItem("donmac.osub")||"power"}catch(e){}
+const LV={ok:["d-safe","Ổn"],info:["d-review","Gợi ý"],warn:["d-review","Nên sửa"],bad:["d-careful","Cần sửa"]};
+const num=(x,d=1)=>x==null?"—":Number(x).toFixed(d).replace(".",",");
+const spinCard=t=>`<div class="card"><span class="spin"></span>${t}</div>`;
+function setOsub(n){
+  OP.sub=n;try{localStorage.setItem("donmac.osub",n)}catch(e){}
+  for(const b of document.querySelectorAll("[data-osub]"))b.classList.toggle("on",b.dataset.osub===n);
+  if(OP.timer){clearInterval(OP.timer);OP.timer=null}
+  const load={power:()=>api("/api/power").then(r=>{OP.power=r}),checks:()=>api("/api/checks").then(r=>{OP.checks=r}),
+    startup:()=>api("/api/startup").then(r=>{OP.startup=r}),watch:()=>api("/api/watch").then(r=>{OP.watch=r}),
+    trends:()=>api("/api/trends?days="+OP.days).then(r=>{OP.trends=r})}[n];
+  renderOsub();
+  load().then(renderOsub).catch(()=>{});
+  if(n==="power")OP.timer=setInterval(()=>{if(tab!=="optim"||OP.sub!=="power"||dead){clearInterval(OP.timer);OP.timer=null;return}
+    if(Date.now()-AC.downAt<800)return;load().then(()=>{if(OP.sub==="power")renderOsub()}).catch(()=>{})},6000);
+}
+function renderOsub(){
+  const f={power:renderPower,checks:renderChecks,startup:renderStartup,watch:renderWatch,trends:renderTrends}[OP.sub];
+  $("o-body").innerHTML=f();
+}
+function renderPower(){
+  const p=OP.power;if(!p)return spinCard("Đang đọc pin và mức tiêu thụ điện (vài giây)…");
+  const b=p.battery;let h="";
+  if(!b)h+=`<div class="card"><h2>Pin & sạc</h2><p class="k">Không đọc được pin: máy này không có pin (Mac để bàn) hoặc không phải macOS.</p></div>`;
+  else{
+    const st=b.lv==="bad"?"b-careful":b.lv==="warn"?"b-review":b.lv==="ok"?"b-safe":"b-info";
+    const flowOut=b.batt_w>=0?`+${num(b.batt_w)}W vào pin`:`${num(b.batt_w)}W rút từ pin`;
+    h+=`<div class="card"><h2 style="display:flex;align-items:center"><span class="bigpct">${b.pct??"?"}%</span>
+        <span class="badge ${st}">${b.connected?(b.charging?"Đang sạc":b.full?"Đã đầy":"Cắm sạc, không sạc"):"Đang dùng pin"}</span></h2>
+      <div class="verd" style="background:var(--${b.lv==="bad"?"careful-bg":b.lv==="warn"?"review-bg":"alt"})">${esc(b.verdict)}</div>
+      <div class="pflow"><div class="bx"><span class="mut">Củ sạc</span><b>${b.connected?(b.adapter_w?b.adapter_w+"W":"?"):"—"}</b><span class="mut">${b.connected?(b.in_w!=null?"đang cấp "+num(b.in_w)+"W":"tối đa"):"không cắm"}</span></div>
+        <span class="ar">→</span><div class="bx"><span class="mut">Máy đang dùng</span><b>${b.sys_w!=null?num(b.sys_w)+"W":"?"}</b><span class="mut">CPU, màn hình, ổ, mạng…</span></div>
+        <span class="ar">${b.batt_w>=0?"→":"←"}</span><div class="bx"><span class="mut">Pin</span><b style="color:var(--${b.batt_w<-0.4?"careful":"safe"})">${flowOut}</b><span class="mut">${b.temp?"nhiệt độ "+num(b.temp,0)+"°C":""}</span></div></div>
+      ${p.charger_advice?`<p class="k" style="margin:4px 0 0">🔌 ${esc(p.charger_advice)}${b.adapter?` <span class="mut">(${esc(b.adapter)})</span>`:""}</p>`:""}
+      ${p.tips.map(t=>`<div class="aflag warn">💡 ${esc(t)}</div>`).join("")}</div>`;
+  }
+  const apps=p.apps||[];const mx=Math.max(1,...apps.map(a=>a.energy));
+  h+=`<div class="card"><h2>App tốn điện nhất lúc này</h2><p class="k">Chỉ số “Tác động năng lượng” giống cột cùng tên trong Giám sát hoạt động: tổng hợp CPU, GPU, đánh thức máy, mạng, ổ đĩa. Càng cao càng hao pin và nóng máy. Đo trong 1 giây, tự cập nhật mỗi 6 giây.</p>
+    ${apps.length?`<table class="mini"><tr><th>App</th><th class="r">Năng lượng</th><th style="width:18%"></th><th class="r">CPU</th><th class="r">RAM</th><th>Nên làm gì</th><th></th></tr>
+    ${apps.map(a=>`<tr class="${a.stuck?"bad":""}"><td><b>${esc(a.label)}</b> ${vbadge(a.verdict)}</td><td class="num">${num(a.energy)}</td>
+      <td><div class="bar" style="margin:0"><div style="width:${(a.energy/mx*100).toFixed(0)}%;${a.stuck?"background:var(--careful)":""}"></div></div></td>
+      <td class="num">${num(a.cpu)}%</td><td class="num">${human(a.mem)}</td><td class="vt" style="max-width:340px">${a.stuck?"Có tiến trình bị kẹt: buộc dừng ở tab Hoạt động. ":""}${esc(a.system?"Thành phần macOS, không cần đóng.":a.tip)}</td>
+      <td class="r"><button class="link" data-goact="${esc(a.key)}">Chi tiết</button></td></tr>`).join("")}</table>`
+    :`<p class="mut">Không đọc được (chỉ có trên macOS) hoặc máy đang rất rảnh.</p>`}</div>`;
+  if(b){
+    const hp=b.health;
+    h+=`<div class="card"><h2>Sức khỏe pin</h2><dl class="kv">
+      <dt>Dung lượng tối đa</dt><dd>${hp!=null?`<b>${hp}%</b> so với lúc mới<div class="bar mem"><div style="width:${hp}%;background:var(--${hp>=80?"safe":hp>=70?"review":"careful"})"></div></div>`:"—"}</dd>
+      <dt>Số lần sạc</dt><dd><b>${b.cycles??"—"}</b> / khoảng 1000 lần thiết kế</dd>
+      <dt>Tình trạng</dt><dd>${esc(b.condition||"—")}</dd>
+      ${b.design_mah?`<dt>Dung lượng</dt><dd>${b.max_mah||"?"} mAh hiện tại / ${b.design_mah} mAh thiết kế</dd>`:""}
+      <dt>Chế độ nguồn điện thấp</dt><dd>${p.low_power==null?"—":p.low_power?"Đang bật":"Đang tắt"} <button class="link" data-ourl="x-apple.systempreferences:com.apple.preference.battery">Mở cài đặt Pin</button></dd></dl>
+      <p class="k" style="margin-top:10px">${hp!=null?(hp>=80?`Pin còn tốt. Pin MacBook được thiết kế giữ khoảng 80% sau 1000 lần sạc; ${hp}% ở ${b.cycles||"?"} lần sạc là bình thường.`:hp>=70?"Pin đã chai: thời gian dùng pin ngắn hơn rõ. Vẫn dùng được; khi macOS báo “Nên bảo dưỡng” thì cân nhắc thay pin.":"Pin chai nhiều: nên thay pin tại trung tâm bảo hành."):""}
+      Giữ pin bền: bật Sạc pin tối ưu, tránh để máy nóng khi sạc (không sạc trên chăn, gối), không cần xả cạn pin.</p></div>`;
+  }
+  return h;
+}
+function renderChecks(){
+  const c=OP.checks;if(!c)return spinCard("Đang kiểm tra cài đặt…");
+  const bad=c.checks.filter(x=>x.lv==="bad"||x.lv==="warn").length;
+  return `<div class="card"><h2>Kiểm tra nhanh (${bad?bad+" mục nên sửa":"mọi thứ ổn"})</h2><p class="k">Các cài đặt và thói quen làm máy tốn RAM, tốn pin hoặc chậm. Spotless Mac chỉ đọc; những gì cần đổi bạn tự bấm trong app tương ứng (có hướng dẫn).</p>
+    ${c.checks.map(x=>`<div class="ock"><span class="dot ${(LV[x.lv]||LV.info)[0]}"></span><div><b>${esc(x.title)}</b> <span class="badge ${x.lv==="ok"?"b-safe":x.lv==="bad"?"b-careful":x.lv==="warn"?"b-review":"b-mute"}">${(LV[x.lv]||LV.info)[1]}</span>
+      <p>${esc(x.text)}</p>${x.fix?`<p class="fx">👉 ${esc(x.fix)}</p>`:""}</div>
+      <div>${x.action?(x.action.kind==="move_app"?`<button class="small" data-omove="${esc(x.action.src)}">${esc(x.action.label)}</button>`:x.action.kind==="open"?`<button class="small" data-ourl="${esc(x.action.url)}">${esc(x.action.label)}</button>`:x.action.kind==="sub"?`<button class="small" data-gosub="${esc(x.action.sub)}">${esc(x.action.label)}</button>`:""):""}</div></div>`).join("")}</div>`;
+}
+function renderStartup(){
+  const s=OP.startup;if(!s)return spinCard("Đang đọc các mục khởi động cùng máy…");
+  const ag=s.agents,lg=s.login||{items:[]};
+  return `<div class="card"><h2>Ứng dụng mở khi đăng nhập (${lg.items.length})</h2><p class="k">App tự mở mỗi lần bạn đăng nhập. Bỏ khỏi danh sách thì app không tự mở nữa; bạn vẫn mở tay được, và thêm lại được ở đây.</p>
+    ${lg.error?`<div class="aflag warn">${esc(lg.error)}</div>`:""}
+    ${lg.items.length?`<table class="mini">${lg.items.map(x=>`<tr><td><b>${esc(x.name)}</b>${x.name&&x.what&&x.name!==x.label?` <span class="mut">· ${esc(x.what)}</span>`:""}<div class="mut">${esc(x.path)}</div></td><td class="r"><button class="link" style="color:var(--danger)" data-ologin="${esc(x.name)}" data-opath="${esc(x.path)}">Bỏ khỏi đăng nhập</button></td></tr>`).join("")}</table>`:`<span class="mut">Không có app nào.</span>`}
+    ${(lg.removed||[]).length?`<p class="k" style="margin-top:8px">Đã bỏ bởi Spotless Mac:</p><table class="mini">${lg.removed.map(x=>`<tr><td>${esc(x.name)}<div class="mut">${esc(x.path)}</div></td><td class="r"><button class="link" data-ologin="${esc(x.name)}" data-oenable="1">Thêm lại</button></td></tr>`).join("")}</table>`:""}
+    <p class="k" style="margin-top:8px">macOS còn có mục “Cho phép chạy nền” cho từng app: <button class="link" data-ourl="x-apple.systempreferences:com.apple.LoginItems-Settings.extension">Mở Cài đặt → Mục đăng nhập</button></p></div>
+  <div class="card"><h2>Chương trình chạy nền (${ag.length})</h2><p class="k">LaunchAgent/Daemon do app cài, chạy ngầm mỗi lần mở máy (trình cập nhật, VPN, Docker…). Mục của bạn (trong ~/Library) tắt được ngay; Spotless Mac cất bản sao để <b>Bật lại</b> bất cứ lúc nào. Mục toàn hệ thống cần quyền quản trị: tắt trong Cài đặt → Mục đăng nhập.</p>
+    <table class="mini"><tr><th>Mục</th><th>Là gì / có nên tắt</th><th></th></tr>
+    ${ag.map(x=>`<tr style="${x.enabled?"":"opacity:.65"}"><td><b>${esc(x.name||x.label)}</b>${x.name?`<div class="mut">${esc(x.label)}</div>`:""}
+      ${x.broken?`<span class="badge b-review">không còn chương trình</span> `:""}<span class="badge ${x.scope==="user"?"b-info":"b-mute"}">${x.scope==="user"?"của bạn":"toàn hệ thống"}</span>${x.enabled?"":` <span class="badge b-mute">đã tắt</span>`}
+      <div class="mut" style="font-size:11.5px;word-break:break-all">${esc(x.program||"")}</div></td>
+      <td class="vt" style="max-width:380px">${esc(x.what)} ${esc(x.broken?"Chương trình không còn trên máy: dấu vết app đã gỡ, tắt đi là an toàn.":x.advice)}</td>
+      <td class="r" style="white-space:nowrap">${x.can_toggle?`<button class="link" ${x.enabled?'style="color:var(--danger)"':""} data-oagent="${esc(x.file)}" data-oenable="${x.enabled?"":"1"}">${x.enabled?"Tắt":"Bật lại"}</button>`:(x.id?`<button class="link" data-reveal="${x.id}">Hiện trong Finder</button>`:"")}</td></tr>`).join("")}</table></div>`;
+}
+function renderWatch(){
+  const w=OP.watch;if(!w)return spinCard("Đang đọc cài đặt…");
+  const ck=(k,t,d)=>`<label style="display:contents"><input type="checkbox" data-wk="${k}" ${w[k]?"checked":""}><span><b>${t}</b><div class="vt">${d}</div></span></label>`;
+  return `<div class="card"><h2>Theo dõi nền ${w.installed?`<span class="badge b-safe">đang chạy</span>`:`<span class="badge b-mute">đang tắt</span>`}</h2>
+    <p class="k">Một tác vụ rất nhẹ chạy mỗi phút kể cả khi Spotless Mac đóng: phát hiện tiến trình bị kẹt, pin tụt khi cắm sạc, máy thiếu RAM, rồi gửi thông báo macOS. Đồng thời ghi lịch sử ổ đĩa, RAM, pin mỗi 30 phút cho mục Lịch sử.</p>
+    ${w.darwin?"":`<p class="mut">Chỉ dùng được trên macOS.</p>`}
+    <div class="wopt">${ck("enabled","Bật theo dõi nền","Tắt là gỡ hẳn tác vụ nền.")}
+      ${ck("stuck","Báo tiến trình ngốn CPU",`Khi một chương trình dùng ≥ <input type="number" data-wn="cpu" min="30" max="400" value="${w.cpu}">% CPU (crashpad: ≥ 20%) liên tục ≥ <input type="number" data-wn="minutes" min="1" max="60" value="${w.minutes}"> phút.`)}
+      ${ck("auto_kill","Tự buộc dừng crashpad_handler bị kẹt","Chỉ áp dụng cho bộ báo cáo sự cố (an toàn: app chủ vẫn chạy). Các chương trình khác chỉ báo, không tự tắt.")}
+      ${ck("battery","Báo pin tụt khi đang cắm sạc","Kèm gợi ý mở tab Pin & sạc để xem app tốn điện.")}
+      ${ck("pressure","Báo máy thiếu RAM","Khi Áp lực bộ nhớ vàng/đỏ kéo dài.")}
+      ${ck("metrics","Ghi lịch sử ổ đĩa, RAM, pin","Mỗi 30 phút một dòng nhỏ, giữ 60 ngày.")}</div>
+    <button class="small" style="margin-left:0" id="wsave">Lưu</button></div>
+  <div class="card"><h2>Biểu tượng trên thanh menu ${w.menu_installed?`<span class="badge b-safe">đang hiện</span>`:""}</h2>
+    <p class="k">Biểu tượng nhỏ cạnh đồng hồ: <b>●</b>/<b>◐</b>/<b>◉</b> là Áp lực bộ nhớ (ổn/cao/quá tải) kèm % CPU; hiện <b>⚠︎</b> khi có tiến trình kẹt và <b>⚡︎</b> khi pin tụt dù cắm sạc. Bấm vào để xem RAM, pin, app nặng nhất và buộc dừng tiến trình kẹt bằng một cú bấm. Lần đầu bật cần biên dịch khoảng 10–30 giây.</p>
+    <button class="small" style="margin-left:0" id="wmenu" ${OP.menuBusy?"disabled":""}>${OP.menuBusy?"Đang biên dịch…":w.menu_installed?"Ẩn biểu tượng":"Hiện biểu tượng trên thanh menu"}</button>
+    ${OP.menuErr?`<div class="aflag bad">${esc(OP.menuErr)}</div>`:""}</div>
+  <div class="card"><h2>Nhật ký theo dõi</h2>${w.log.length?`<table class="mini">${w.log.map(x=>`<tr><td class="mut" style="white-space:nowrap">${esc(when(x.t))}</td><td>${{kill:"✅",stuck:"⚠️",battery:"🔋",pressure:"🧠"}[x.kind]||"•"} ${esc(x.text)}</td></tr>`).join("")}</table>`:`<span class="mut">Chưa có sự kiện nào.</span>`}</div>`;
+}
+function lineChart(pts,o={}){
+  if(pts.length<2)return `<p class="mut">Chưa đủ dữ liệu.</p>`;
+  const W=760,H=o.h||150,L=56,R=10,T=10,B=22,fmt=o.fmt||human;
+  const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  const x0=Math.min(...xs),x1=Math.max(...xs)||x0+1;let y0=o.min??Math.min(...ys),y1=o.max??Math.max(...ys);if(y1===y0){y1+=1;y0-=1}
+  const X=x=>L+(x-x0)/((x1-x0)||1)*(W-L-R),Y=y=>T+(1-(y-y0)/(y1-y0))*(H-T-B);
+  const d=pts.map((p,i)=>(i?"L":"M")+X(p[0]).toFixed(1)+" "+Y(p[1]).toFixed(1)).join(" ");
+  const ticks=[y0,(y0+y1)/2,y1];
+  const dfmt=t=>new Date(t*1000).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit"});
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}">${ticks.map(t=>`<line class="gr" x1="${L}" x2="${W-R}" y1="${Y(t)}" y2="${Y(t)}"/><text x="${L-6}" y="${Y(t)+4}" text-anchor="end">${esc(fmt(t))}</text>`).join("")}
+    <path class="ln" d="${d}" stroke="${o.color||"var(--accent)"}"/><text x="${L}" y="${H-5}">${dfmt(x0)}</text><text x="${W-R}" y="${H-5}" text-anchor="end">${dfmt(x1)}</text></svg>`;
+}
+function renderTrends(){
+  const t=OP.trends;if(!t)return spinCard("Đang đọc lịch sử…");
+  const m=t.metrics;
+  const seg=`<div class="subseg" style="margin:0 0 10px">${[7,30,60].map(d=>`<button data-odays="${d}" class="${OP.days===d?"on":""}">${d} ngày</button>`).join("")}</div>`;
+  let h=seg;
+  if(m.length<2)h+=`<div class="card"><h2>Chưa có đủ dữ liệu</h2><p class="k">Lịch sử được ghi mỗi 30 phút khi Spotless Mac mở, hoặc liên tục nếu bật <b>Theo dõi nền</b> (mục bên cạnh). Quay lại sau vài giờ là có biểu đồ.</p><button class="small" style="margin-left:0" data-gosub="watch">Bật theo dõi nền</button></div>`;
+  else{
+    const pj=t.proj;
+    h+=`<div class="card"><h2>Dung lượng ổ trống</h2>${pj?`<p class="k">${pj.per_day<0?`Ổ đầy thêm khoảng <b>${human(-pj.per_day)}/ngày</b> trong 7 ngày qua${pj.days_left?`; giữ tốc độ này thì <b>hết chỗ sau khoảng ${Math.round(pj.days_left)} ngày</b>`:""}.`:`Ổ trống tăng hoặc ổn định trong 7 ngày qua (${human(pj.per_day)}/ngày).`}</p>`:""}
+      ${lineChart(m.map(r=>[r.t,r.free]),{min:0})}</div>`;
+    const mm=m.filter(r=>r.mem_used!=null);
+    if(mm.length>1)h+=`<div class="card"><h2>RAM đã dùng và swap</h2><p class="k">Đường xanh: RAM đã dùng; đường tím: swap (RAM tràn ra ổ đĩa). Swap tăng đều qua nhiều ngày là dấu hiệu nên khởi động lại máy hoặc đóng bớt app chạy lâu.</p>
+      ${lineChart(mm.map(r=>[r.t,r.mem_used]),{min:0,max:mm[0].mem_total})}${lineChart(mm.map(r=>[r.t,r.swap||0]),{min:0,color:"#bf5af2",h:110})}</div>`;
+    const bb=m.filter(r=>r.batt!=null);
+    if(bb.length>1)h+=`<div class="card"><h2>Pin</h2>${lineChart(bb.map(r=>[r.t,r.batt]),{min:0,max:100,fmt:v=>Math.round(v)+"%",color:"#30d158",h:120})}</div>`;
+  }
+  if(t.growth.length)h+=`<div class="card"><h2>Ổ đầy lên vì đâu (giữa 2 lần quét gần nhất)</h2><p class="k">${esc(when(t.last_scan_pair[0]))} → ${esc(when(t.last_scan_pair[1]))}</p>
+    <table class="mini">${t.growth.map(g=>`<tr><td>${esc(g.title)}</td><td class="num" style="color:var(--${g.delta>0?"careful":"safe"})">${g.delta>0?"+":"−"}${human(Math.abs(g.delta))}</td></tr>`).join("")}</table></div>`;
+  if(t.freed.length){const mx=Math.max(1,...t.freed.map(w=>w.size));
+    h+=`<div class="card"><h2>Đã dọn theo tuần</h2><p class="k">Tổng ${human(t.freed.reduce((a,w)=>a+w.size,0))} trong ${t.freed.length} tuần có dọn dẹp.</p>
+      <div class="wbars">${t.freed.map(w=>`<div title="${esc(human(w.size))} · ${w.n} mục" style="height:${Math.max(2,w.size/mx*100)}%"><span>${new Date(w.t*1000).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit"})}</span></div>`).join("")}</div><div style="height:20px"></div></div>`}
+  return h;
+}
+document.addEventListener("click",async e=>{
+  const gs=e.target.closest("[data-gosub]");if(gs){if(tab!=="optim")setTab("optim");setOsub(gs.dataset.gosub);return}
+  if(tab!=="optim")return;
+  const os=e.target.closest("[data-osub]");if(os){setOsub(os.dataset.osub);return}
+  const ga=e.target.closest("[data-goact]");if(ga){AC.open.add(ga.dataset.goact);setTab("activity");return}
+  const ou=e.target.closest("[data-ourl]");if(ou){api("/api/open_url",{url:ou.dataset.ourl});return}
+  const od=e.target.closest("[data-odays]");if(od){OP.days=+od.dataset.odays;OP.trends=null;setOsub("trends");return}
+  const om=e.target.closest("[data-omove]");
+  if(om){if(!confirm(`Chuyển app này vào thư mục Ứng dụng?\n\n${om.dataset.omove}\n\nHãy thoát app trước (⌘Q).`))return;
+    const r=await api("/api/move_app",{src:om.dataset.omove});toast(r.ok?`✅ Đã chuyển vào ${esc(r.dest)}. Mở lại app từ thư mục Ứng dụng.`:`⚠️ ${esc(r.error)}`);setOsub("checks");return}
+  const oa=e.target.closest("[data-oagent]");
+  if(oa){const en=!!oa.dataset.oenable;
+    if(!en&&!confirm(`Tắt “${oa.dataset.oagent}”?\n\nChương trình này sẽ không tự chạy cùng máy nữa. Spotless Mac cất bản sao để bạn Bật lại bất cứ lúc nào.`))return;
+    const r=await api("/api/agent_toggle",{file:oa.dataset.oagent,enable:en});toast(r.ok?(en?"✅ Đã bật lại":"✅ Đã tắt"):`⚠️ ${esc(r.error||"Không thực hiện được")}`);setOsub("startup");return}
+  const ol=e.target.closest("[data-ologin]");
+  if(ol){const en=!!ol.dataset.oenable;
+    if(!en&&!confirm(`Bỏ “${ol.dataset.ologin}” khỏi danh sách mở khi đăng nhập?\n\nApp không bị gỡ; bạn thêm lại được ở đây.`))return;
+    const r=await api("/api/login_toggle",{name:ol.dataset.ologin,path:ol.dataset.opath||"",enable:en});toast(r.ok?"✅ Xong":`⚠️ ${esc(r.error||"Không thực hiện được")}`);setOsub("startup");return}
+  if(e.target.closest("#wsave")){const b={};for(const c of document.querySelectorAll("[data-wk]"))b[c.dataset.wk]=c.checked;
+    for(const n of document.querySelectorAll("[data-wn]"))b[n.dataset.wn]=+n.value;
+    OP.watch=await api("/api/watch_set",b);toast(OP.watch.enabled?"✅ Đã bật theo dõi nền":"Đã tắt theo dõi nền");renderOsub();return}
+  if(e.target.closest("#wmenu")){const on=!OP.watch.menu_installed;OP.menuBusy=on;OP.menuErr="";renderOsub();
+    const r=await api("/api/menu_set",{enabled:on});OP.menuBusy=false;OP.watch=r;
+    if(!r.ok&&r.error)OP.menuErr=r.error+(r.detail?" "+r.detail:"");else toast(on?"✅ Biểu tượng đã hiện trên thanh menu":"Đã ẩn biểu tượng");
+    renderOsub();return}
+});
+document.addEventListener("input",e=>{if(e.target.matches("[data-wn]"))e.stopPropagation()});
+
 /* ================= 003: Máy & cài đặt ================= */
 const dur=s=>{if(s==null)return"—";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+" ngày ":"")+(h?h+" giờ ":"")+m+" phút"};
 const when=t=>t?new Date(t*1000).toLocaleString("vi-VN"):"";
@@ -4762,8 +5990,7 @@ function renderMachine(r){
   const dot={ok:"d-safe",warn:"d-careful",unknown:"d-review"};
   $("m-sec").innerHTML=`<div class="card"><h2>Bảo mật cơ bản (chỉ xem)</h2><p class="k">Spotless Mac không thay đổi cài đặt hệ thống và không phải phần mềm diệt virus.</p>
     ${r.security.map(x=>`<div class="secrow"><span class="dot ${dot[x.state]}" style="margin-top:6px"></span><b>${esc(x.label)}</b><span>${esc(x.value)}</span>${x.state==="warn"?`<span class="hint">${esc(x.hint)}</span>`:""}</div>`).join("")}</div>`;
-  $("m-start").innerHTML=`<div class="card"><h2>Mục tự khởi động (${r.startup.length})</h2><p class="k">Chương trình chạy cùng máy. Mục đánh dấu “không còn chương trình” thường là dấu vết của app đã gỡ. Spotless Mac chỉ liệt kê, hãy xóa bằng Finder nếu chắc chắn.</p>
-    ${r.startup.length?`<table class="mini"><tr><th>Mục</th><th>Chương trình</th><th></th></tr>${r.startup.map(x=>`<tr><td>${esc(x.label)}<div class="mut">${esc(x.where)}</div></td><td>${x.broken?`<span class="badge b-review">không còn chương trình</span> `:""}<span class="mut">${esc(x.program||"")}</span></td><td class="r">${x.id?`<button class="link" data-reveal="${x.id}">Hiện trong Finder</button>`:""}</td></tr>`).join("")}</table>`:`<span class="mut">Không có mục nào ngoài của Apple.</span>`}</div>`;
+  $("m-start").innerHTML=`<div class="card"><h2>Mục tự khởi động (${r.startup.length})</h2><p class="k">Xem giải thích và tắt/bật từng mục ở tab <b>Pin &amp; tối ưu → Khởi động cùng máy</b>.</p><button class="small" style="margin-left:0" data-gosub="startup">Mở</button></div>`;
 }
 async function keepSelected(){
   const ids=tab==="suggest"?items.filter(i=>selected.has(i.id)&&i.path).map(i=>i.id):selEntries().map(e=>e.id);
@@ -4844,7 +6071,7 @@ document.addEventListener("change",e=>{
   if(t.dataset.catbox){for(const i of items)if(i.cat===t.dataset.catbox)t.checked?selected.add(i.id):selected.delete(i.id);renderSuggest()}
 });
 document.addEventListener("keydown",e=>{
-  if(tab==="suggest"||tab==="tools"||tab==="machine"||tab==="activity"||e.target.matches("input,textarea,select"))return;
+  if(tab==="suggest"||tab==="tools"||tab==="machine"||tab==="activity"||tab==="optim"||e.target.matches("input,textarea,select"))return;
   const meta=e.metaKey||e.ctrlKey, t=cur();
   if(meta&&(e.key==="Backspace"||e.key==="Delete")){e.preventDefault();if(!$("go").disabled)deleteSelected();return}
   if(meta&&e.key.toLowerCase()==="a"){e.preventDefault();t.sel=new Set(visibleOrder().filter(x=>x.deletable).map(x=>x.id));paintSel();return}
@@ -4866,7 +6093,7 @@ setInterval(()=>{if(!dead)api("/api/ping",{}).catch(()=>{})},20000);
 addEventListener("pagehide",()=>{try{navigator.sendBeacon("/api/bye?t="+TOKEN)}catch(e){}});
 addEventListener("pageshow",e=>{if(e.persisted&&!dead)api("/api/ping",{}).catch(()=>{})});
 refresh();
-try{const sv=localStorage.getItem("donmac.tool");if(sv&&TL[sv])tool=sv;const saved=localStorage.getItem("donmac.tab");if(saved&&saved!=="suggest"&&(T[saved]||saved==="tools"||saved==="machine"||saved==="activity"))setTab(saved)}catch(e){}
+try{const sv=localStorage.getItem("donmac.tool");if(sv&&TL[sv])tool=sv;const saved=localStorage.getItem("donmac.tab");if(saved&&saved!=="suggest"&&(T[saved]||saved==="tools"||saved==="machine"||saved==="activity"||saved==="optim"))setTab(saved)}catch(e){}
 </script>
 </body>
 </html>
@@ -5184,6 +6411,19 @@ def install():
 def main():
     if "--install" in sys.argv:
         return install()
+    if "--watch" in sys.argv:  # LaunchAgent gọi mỗi phút
+        watch_once()
+        return
+    if "--mini" in sys.argv:  # biểu tượng thanh menu đọc dữ liệu
+        print(json.dumps(mini_status(), ensure_ascii=False))
+        return
+    if "--mini-act" in sys.argv:
+        i = sys.argv.index("--mini-act")
+        print(json.dumps(mini_act(sys.argv[i + 1] if i + 1 < len(sys.argv) else ""), ensure_ascii=False))
+        return
+    if "--menu-off" in sys.argv:
+        menu_set(False)
+        return
     if "--auto-clean" in sys.argv:  # chạy nền theo lịch: chỉ dọn mục An toàn, ghi lịch sử
         mb = 200
         if "--min-mb" in sys.argv:

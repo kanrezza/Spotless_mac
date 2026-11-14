@@ -104,8 +104,14 @@ const ok = m => console.log('✓ ' + m);
       await p.waitForSelector('#m-keep .mini', {timeout: 30000});
       await p.waitForSelector('#m-sec .secrow', {timeout: 30000});
       const mt = await p.$eval('#v-machine', x => x.textContent);
-      for (const w of ['Dọn tự động theo lịch', 'Luôn giữ', 'Lịch sử dọn dẹp', 'Trạng thái máy', 'Bảo mật cơ bản', 'Mục tự khởi động', 'com.gone.helper', 'không còn chương trình'])
+      for (const w of ['Dọn tự động theo lịch', 'Luôn giữ', 'Lịch sử dọn dẹp', 'Trạng thái máy', 'Bảo mật cơ bản', 'Mục tự khởi động'])
         if (!mt.includes(w)) fail('tab Máy & cài đặt thiếu: ' + w);
+      await p.click('#m-start [data-gosub=startup]');
+      await p.waitForSelector('#o-body [data-oagent], #o-body .mini', {timeout: 30000});
+      await p.waitForFunction(() => document.querySelector('#o-body').textContent.includes('com.gone.helper'), null, {timeout: 30000});
+      if (!(await p.$eval('#o-body', x => x.textContent)).includes('không còn chương trình')) fail('Khởi động cùng máy thiếu nhãn không còn chương trình');
+      await p.click('[data-tab=machine]');
+      await p.waitForSelector('#m-keep .mini', {timeout: 30000});
       if (!mt.includes('com.test.foo') && !mt.includes('Foo.app')) { /* lịch sử có ghi lần gỡ Foo */ }
       if (!(await p.$eval('#m-hist', x => x.textContent)).includes('Foo')) fail('lịch sử thiếu lần gỡ Foo');
       ok('tab Máy & cài đặt: lịch, Luôn giữ, lịch sử, trạng thái máy, bảo mật, khởi động');

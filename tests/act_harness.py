@@ -5,7 +5,7 @@ import importlib.util, os, subprocess, sys
 SRC = os.path.join(os.path.dirname(__file__), "..", "src", "don_mac.py")
 spec = importlib.util.spec_from_file_location("d", SRC); d = importlib.util.module_from_spec(spec); spec.loader.exec_module(d)
 me = d.me_user()
-victim = subprocess.Popen(["sleep", "600"])  # tiến trình thật để thử Buộc dừng
+victim = subprocess.Popen(["sleep", "600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # tiến trình thật để thử Buộc dừng
 os.environ["ACT_VICTIM"] = str(victim.pid)
 CH = "/Applications/Claude.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler"
 BR = "/Applications/Brave Browser.app/Contents/Frameworks/Brave Browser Framework.framework/Versions/1/Helpers/Brave Browser Helper (Renderer).app/Contents/MacOS/Brave Browser Helper (Renderer)"
@@ -82,6 +82,31 @@ def fake_many(bid, items):
     return {"ok": True, "done": len(items), "fail": 0}
 
 
+# --- 005: pin, app tốn điện, khởi động, kiểm tra, lịch sử (dữ liệu giả)
+import json as _j, plistlib as _p, time as _t
+_IO = _p.dumps([{"CurrentCapacity": 64, "MaxCapacity": 100, "Voltage": 12500, "InstantAmperage": 2 ** 64 - 400, "ExternalConnected": True,
+                 "IsCharging": True, "AdapterDetails": {"Watts": 30, "Name": "30W USB-C Power Adapter"},
+                 "PowerTelemetryData": {"SystemLoad": 33000, "SystemPowerIn": 28000}, "Temperature": 3150, "CycleCount": 399,
+                 "DesignCapacity": 4382, "NominalChargeCapacity": 3780}]).decode()
+_orig_bi = d.battery_info
+d.battery_info = lambda *a, **k: _orig_bi(_IO, "")
+d.hw_model = lambda: {"name": "MacBook Air", "model": "Mac14,2", "chip": "Apple M2"}
+_orig_ea = d.energy_apps
+d.energy_apps = lambda groups=None, top_text=None: _orig_ea(groups, f"PID POWER COMMAND\nPID POWER COMMAND\n{victim.pid} 150.2 c\n41983 22.5 b\n7000 9.1 q\n")
+H = os.environ["HOME"]
+la = os.path.join(H, "Library/LaunchAgents"); os.makedirs(la, exist_ok=True)
+with open(os.path.join(la, "com.google.keystone.agent.plist"), "wb") as f:
+    _p.dump({"Label": "com.google.keystone.agent", "ProgramArguments": ["/x/GoogleSoftwareUpdateAgent"], "RunAtLoad": True}, f)
+br = os.path.join(H, "Library/Application Support/BraveSoftware/Brave-Browser"); os.makedirs(br, exist_ok=True)
+_j.dump({"performance_tuning": {"high_efficiency_mode": {"state": 0}}, "background_mode": {"enabled": True}}, open(os.path.join(br, "Local State"), "w"))
+os.makedirs(d.DATA_DIR, exist_ok=True)
+with open(os.path.join(d.DATA_DIR, "metrics.jsonl"), "w") as f:
+    for i in range(30):
+        f.write(_j.dumps({"t": _t.time() - (29 - i) * 6 * 3600, "free": 80e9 - i * 6e8, "total": 245e9, "mem_used": 11e9 + (i % 5) * 1e9,
+                          "mem_total": 17.2e9, "swap": 1e9 + i * 1e8, "batt": 40 + (i * 7) % 60}) + "\n")
+d.record_scan([{"cat": "caches", "size": 1e9}])
+d.record_scan([{"cat": "caches", "size": 4e9}])
+d.log_history([{"t": _t.time() - 86400 * 8, "label": "a", "size": 2e9, "mode": "trash"}, {"t": _t.time() - 3600, "label": "b", "size": 7e8, "mode": "trash"}])
 d.browser_tabs = fake_tabs
 d.tabs_close_many = fake_many
 d.tab_action = fake_act
