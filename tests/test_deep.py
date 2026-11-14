@@ -117,7 +117,25 @@ gr = d.proc_snapshot(PS, "", None)
 na = d.net_apps(gr, NT)
 check(na["apps"][0]["label"] == "Brave Browser" and na["apps"][0]["in_s"] > 1e6, "xếp Brave đầu theo tốc độ tải")
 check("tab" in na["apps"][0]["tip"].lower(), "mẹo riêng cho trình duyệt")
-check(d.net_apps(gr, "")["error"], "không có nettop → báo rõ")
+fb = d.net_apps(gr, "")
+check(fb["error"] and fb["hint"] and "total" in fb, "không có nettop → báo rõ + hiện tổng của máy")
+NT2 = """time,name,bytes_out,bytes_in,
+00:00:01,Brave Browser.41896,200,1000,
+time,name,bytes_out,bytes_in,
+00:00:02,Brave Browser.41896,500,2000000,
+"""
+check(d.parse_nettop(NT2)[1][41896] == (2000000, 500), "đọc nettop khi thứ tự cột đảo")
+NS = """Name  Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+en0   1500  <Link#6>    aa:bb:cc:dd:ee:ff  1000     0   50000000     800     0   9000000     0
+lo0   16384 <Link#1>                        5         0       100       5     0       100     0
+"""
+nt = d.net_total(NS)
+check(nt["in"] == 50000000 and nt["out"] == 9000000 and nt["ifaces"] == ["en0"], "tổng lưu lượng theo card mạng (bỏ lo0)")
+t4 = d.thermal([{"label": "WindowServer", "cpu": 65.0, "key": "w", "procs": [], "system": True,
+                 "info": {"act": "Đóng bớt cửa sổ."}}], "", {"temp": 30})
+check(t4["state"] == "ok" and "WindowServer" in t4["msg"] and any("không đóng được" in x for x in t4["tips"]),
+      "tiến trình hệ thống nặng: không bảo buộc dừng, nói đúng cách xử lý")
+check("chip Apple" in d.thermal([], "", None)["note"], "máy chip Apple không báo tốc độ CPU → giải thích")
 
 # ---------- quyền riêng tư
 db = os.path.join(HOME, "Library/Application Support/com.apple.TCC")

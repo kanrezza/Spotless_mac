@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "6.1.0"
+VERSION = "6.1.1"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -4953,7 +4953,8 @@ def thermal(groups=None, therm_text=None, batt=None):
         thr.append(f"tạm khóa bớt nhân CPU ({avail}/{ncpu} nhân đang dùng được)")
     if kt >= 100:
         thr.append(f"kernel_task đang chiếm {kt:.0f}% CPU — cách macOS tự chiếm chỗ để ép máy chạy chậm lại cho nguội")
-    hot = [g for g in groups if g["cpu"] >= 40][:5]
+    hot = [dict(key=g["key"], label=g["label"], cpu=g["cpu"], system=g.get("system", False),
+                act=(g.get("info") or {}).get("act", "")) for g in groups if g["cpu"] >= 40][:5]
     if temp is None and not t and not thr:
         state, lv = "unknown", "info"
     elif thr:
@@ -4962,71 +4963,115 @@ def thermal(groups=None, therm_text=None, batt=None):
         state, lv = "hot", "warn"
     else:
         state, lv = "ok", "ok"
+    hotnames = ", ".join(f"{g['label']} {g['cpu']:.0f}%" for g in hot[:2])
     msg = {"throttle": "Máy đang nóng và bị hạ hiệu năng: " + "; ".join(thr) + ".",
            "hot": f"Máy đang ấm{f' (pin {temp:.0f}°C)' if temp else ''} nhưng chưa bị hạ hiệu năng.",
-           "ok": f"Nhiệt độ bình thường{f' (pin {temp:.0f}°C)' if temp else ''}, không bị hạ hiệu năng.",
+           "ok": f"Nhiệt độ bình thường{f' (pin {temp:.0f}°C)' if temp else ''}, không bị hạ hiệu năng."
+                 + (f" Có app đang chạy nặng ({hotnames}) nên máy sẽ ấm dần nếu kéo dài." if hot else ""),
            "unknown": "Không đọc được thông tin nhiệt trên máy này."}[state]
     tips = []
-    if hot:
-        tips.append("Đang đốt CPU nhiều nhất: " + ", ".join(f"{g['label']} {g['cpu']:.0f}%" for g in hot)
+    closable = [g for g in hot if not g["system"]]
+    if closable:
+        tips.append("Đang đốt CPU nhiều nhất: " + ", ".join(f"{g['label']} {g['cpu']:.0f}%" for g in closable)
                     + ". Đóng hoặc buộc dừng ở tab Hoạt động sẽ hạ nhiệt nhanh nhất.")
+    for g in hot:
+        if g["system"] and g["label"].lower() != "kernel_task":
+            tips.append(f"{g['label']} đang ở {g['cpu']:.0f}% CPU. Đây là thành phần của macOS, không đóng được. "
+                        + (g["act"] or "Đóng bớt cửa sổ và tab để nó nhẹ bớt."))
     if state in ("throttle", "hot"):
         tips += ["Kê máy lên mặt phẳng cứng, thoáng (đừng đặt trên chăn, gối, đùi): MacBook thoát nhiệt qua vỏ.",
                  "Rút sạc một lát nếu pin đang nóng, hoặc bật Chế độ nguồn điện thấp.",
                  "Phòng nóng, nắng chiếu trực tiếp hoặc ốp lưng dày đều làm máy nóng hơn thấy rõ."]
     if kt >= 100:
         tips.append("kernel_task cao gần như luôn là chuyện nhiệt chứ không phải lỗi: đừng buộc dừng nó (cũng không dừng được).")
+    note = ("macOS không cho đọc nhiệt độ CPU nếu không có quyền quản trị, nên Spotless Mac dùng nhiệt độ pin "
+            "và tín hiệu hạ xung của hệ thống — đủ để biết máy có đang nóng và bị chậm lại hay không.")
+    if speed is None:
+        note += (" Trên máy chip Apple (M1/M2/M3…), macOS thường không báo chỉ số “tốc độ CPU” qua pmset, nên ô đó để trống "
+                 "là bình thường; lúc đó dấu hiệu máy bị ép chạy chậm vì nóng là kernel_task vọt lên hàng trăm phần trăm.")
     return {"state": state, "lv": lv, "msg": msg, "temp": temp, "speed": speed, "sched": sched,
-            "avail": avail, "ncpu": ncpu, "kernel_task": kt, "raw": t,
-            "hot": [{"key": g["key"], "label": g["label"], "cpu": g["cpu"]} for g in hot], "tips": tips,
-            "note": "macOS không cho đọc nhiệt độ CPU nếu không có quyền quản trị, nên Spotless Mac dùng nhiệt độ pin "
-                    "và tín hiệu hạ xung của hệ thống — đủ để biết máy có đang nóng và bị chậm lại hay không."}
+            "avail": avail, "ncpu": ncpu, "kernel_task": kt, "raw": t, "hot": hot, "tips": tips, "note": note}
 
 
 # ---- mạng theo app
 def parse_nettop(text):
-    """nettop -P -x -L 2: hai mẫu liên tiếp, giá trị cộng dồn từ lúc tiến trình chạy."""
-    samples, cur = [], None
+    """nettop -x -L 2: trả về danh sách các mẫu {pid: (byte vào, byte ra)}. Đọc theo tên cột trong dòng tiêu đề."""
+    samples, cur, ci, co, cn = [], None, 2, 3, 1
     for ln in (text or "").splitlines():
         ln = ln.strip()
         if not ln:
             continue
-        if ln.lower().startswith("time,"):
+        f = [x.strip() for x in ln.split(",")]
+        low = [x.lower() for x in f]
+        if "bytes_in" in low or low[:1] == ["time"]:
             if cur:
                 samples.append(cur)
             cur = {}
+            if "bytes_in" in low:
+                ci, co = low.index("bytes_in"), low.index("bytes_out")
+                cn = next((i for i, x in enumerate(low) if x in ("name", "")), 1)
             continue
         if cur is None:
             cur = {}
-        f = ln.split(",")
-        if len(f) < 4:
+        if max(ci, co, cn) >= len(f):
             continue
-        name = f[1].strip()
-        if "." not in name:
-            continue
+        name = f[cn]
         pid = name.rsplit(".", 1)[-1]
         if not pid.isdigit():
             continue
         try:
-            cur[int(pid)] = (int(float(f[2] or 0)), int(float(f[3] or 0)))
+            cur[int(pid)] = (int(float(f[ci] or 0)), int(float(f[co] or 0)))
         except ValueError:
             continue
     if cur:
         samples.append(cur)
-    return samples
+    return [x for x in samples if x]
+
+
+def _nettop(args, t=25):
+    try:
+        r = subprocess.run(["nettop"] + args, capture_output=True, text=True, timeout=t,
+                           env=dict(os.environ, LC_ALL="C", TERM="dumb"))
+        return r.stdout, (r.stderr or "").strip()
+    except FileNotFoundError:
+        return "", "Máy không có lệnh nettop."
+    except Exception as e:
+        return "", str(e)
+
+
+def net_total(text=None):
+    """Dự phòng: tổng lưu lượng theo card mạng (netstat -ib) khi không đọc được theo app."""
+    if text is None:
+        text = sh(["netstat", "-ib"], 15)
+    seen, tin, tout = set(), 0, 0
+    for ln in (text or "").splitlines()[1:]:
+        f = ln.split()
+        if len(f) < 10 or not f[0].startswith(("en", "utun", "ppp", "bridge", "awdl")) or f[0] in seen:
+            continue
+        seen.add(f[0])
+        nums = [x for x in f if x.isdigit()]
+        if len(nums) >= 6:
+            tin += int(nums[-5])
+            tout += int(nums[-2])
+    return {"in": tin, "out": tout, "ifaces": sorted(seen)}
 
 
 def net_apps(groups=None, text=None, secs=1.0):
+    err = ""
     if text is None:
-        try:
-            r = subprocess.run(["nettop", "-P", "-x", "-L", "2", "-J", "bytes_in,bytes_out"],
-                               capture_output=True, text=True, timeout=25, env=dict(os.environ, LC_ALL="C"))
-            text = r.stdout
-        except Exception:
-            text = ""
+        for args in (["-P", "-x", "-L", "2", "-J", "bytes_in,bytes_out"], ["-P", "-x", "-L", "2"],
+                     ["-x", "-L", "2", "-J", "bytes_in,bytes_out"]):
+            text, err = _nettop(args)
+            if parse_nettop(text):
+                break
     sm = parse_nettop(text)
-    if not sm:
-        return {"apps": [], "error": "Không đọc được số liệu mạng (lệnh nettop của macOS không chạy được ở đây)."}
+    if len(sm) < 1:
+        tot = net_total()
+        return {"apps": [], "total": tot, "secs": secs,
+                "error": "macOS không cho Spotless Mac xem lưu lượng theo từng app ở đây"
+                         + (f" (nettop báo: {err[:120]})" if err else " (lệnh nettop không trả về dữ liệu)") + ".",
+                "hint": "Thường là do app chạy trong môi trường bị giới hạn. Cách xem theo app không cần quyền gì thêm: "
+                        "mở Giám sát hoạt động → thẻ Mạng. Dưới đây là tổng lưu lượng của máy từ lúc khởi động."}
     first, last = sm[0], sm[-1]
     groups = groups if groups is not None else proc_snapshot()
     out = []
@@ -5045,7 +5090,7 @@ def net_apps(groups=None, text=None, secs=1.0):
                     "in": tin, "out": tout, "in_s": din / secs, "out_s": dout / secs,
                     "tip": net_tip(g, tin, tout)})
     out.sort(key=lambda x: -(x["in_s"] + x["out_s"] + (x["in"] + x["out"]) / 1e6))
-    return {"apps": out[:20], "error": "", "secs": secs}
+    return {"apps": out[:20], "error": "", "secs": secs, "total": net_total(), "hint": ""}
 
 
 def net_tip(g, tin, tout):
@@ -6572,7 +6617,7 @@ function renderThermal(){
     <div class="verd">${esc(t.msg)}</div>
     <div class="pflow" style="grid-template-columns:repeat(3,1fr)">
       <div class="bx"><span class="mut">Nhiệt độ pin</span><b>${t.temp!=null?num(t.temp,0)+"°C":"—"}</b><span class="mut">${t.temp!=null?(t.temp>=37?"nóng":t.temp>=33?"ấm":"bình thường"):"không đọc được"}</span></div>
-      <div class="bx"><span class="mut">Tốc độ CPU</span><b style="color:var(--${t.speed!=null&&t.speed<100?"careful":"text"})">${t.speed!=null?t.speed+"%":"—"}</b><span class="mut">${t.speed!=null&&t.speed<100?"đang bị hạ xung":"không bị hạ"}</span></div>
+      <div class="bx"><span class="mut">Tốc độ CPU</span><b style="color:var(--${t.speed!=null&&t.speed<100?"careful":"text"})">${t.speed!=null?t.speed+"%":"n/a"}</b><span class="mut">${t.speed==null?"chip Apple không báo":t.speed<100?"đang bị hạ xung":"không bị hạ"}</span></div>
       <div class="bx"><span class="mut">Nhân CPU dùng được</span><b>${t.avail!=null?t.avail+"/"+t.ncpu:t.ncpu}</b><span class="mut">${t.kernel_task>=50?"kernel_task "+num(t.kernel_task,0)+"%":"bình thường"}</span></div></div>
     ${t.tips.map(x=>`<div class="aflag ${t.lv==="bad"?"bad":"warn"}">💡 ${esc(x)}</div>`).join("")}
     <p class="k" style="margin-top:8px">${esc(t.note)}</p></div>
@@ -6581,7 +6626,10 @@ function renderThermal(){
 }
 function renderNet(){
   const n=OP.net;if(!n)return spinCard("Đang đo lưu lượng mạng (vài giây)…");
-  if(n.error)return `<div class="card"><h2>Mạng theo app</h2><p class="k">${esc(n.error)}</p></div>`;
+  const tot=n.total?`<div class="card"><h2>Tổng lưu lượng của máy</h2><p class="k">Từ lúc khởi động máy, cộng mọi card mạng (${esc((n.total.ifaces||[]).join(", ")||"—")}).</p>
+    <div class="pflow" style="grid-template-columns:repeat(2,1fr)"><div class="bx"><span class="mut">Đã tải xuống</span><b>${human(n.total.in)}</b></div>
+    <div class="bx"><span class="mut">Đã tải lên</span><b>${human(n.total.out)}</b></div></div></div>`:"";
+  if(n.error)return `<div class="card"><h2>Mạng theo app</h2><div class="aflag warn">${esc(n.error)}</div>${n.hint?`<p class="k">${esc(n.hint)}</p>`:""}</div>`+tot;
   const mx=Math.max(1,...n.apps.map(a=>a.in_s+a.out_s));
   const sp=v=>human(v)+"/giây";
   return `<div class="card"><h2>App dùng mạng nhiều nhất</h2>
@@ -6591,7 +6639,7 @@ function renderNet(){
       <td class="num">${a.in_s>=1024?sp(a.in_s):"—"}</td><td class="num">${a.out_s>=1024?sp(a.out_s):"—"}</td>
       <td><div class="bar" style="margin:0"><div style="width:${((a.in_s+a.out_s)/mx*100).toFixed(0)}%"></div></div></td>
       <td class="num">${human(a.in)}</td><td class="num">${human(a.out)}</td><td class="vt" style="max-width:300px">${esc(a.tip)}</td></tr>`).join("")}</table>`
-    :`<p class="mut">Không app nào đang dùng mạng đáng kể.</p>`}</div>`;
+    :`<p class="mut">Không app nào đang dùng mạng đáng kể.</p>`}</div>`+tot;
 }
 function renderPriv(){
   const p=OP.priv;if(!p)return spinCard("Đang đọc danh sách quyền…");
