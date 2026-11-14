@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.3.0"
+VERSION = "5.3.1"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -2791,6 +2791,12 @@ def explain_group(g):
                 "act": "Nếu không dùng, thoát app (⌘Q) để giải phóng RAM. Lưu công việc trước.",
                 "when": "Khi bạn không dùng app trong vài giờ tới."}
     p = g["procs"][0]
+    if "/emulator/" in p.get("path", "") and "qemu" in p["name"].lower():
+        return {"what": "Android Emulator: máy ảo Android do Android Studio mở để chạy thử app (thiết bị ảo trong Device Manager).",
+                "why": "Máy ảo được cấp cố định 2–6 GB RAM cho cả hệ điều hành Android bên trong, kể cả khi bạn không bấm gì trên điện thoại ảo.",
+                "act": "Đóng cửa sổ Emulator, hoặc Android Studio → Device Manager → bấm ■ (Stop) ở thiết bị đang chạy. "
+                       "Muốn nhẹ hơn lần sau: Device Manager → Edit → giảm RAM của thiết bị ảo, hoặc test trên điện thoại thật qua USB.",
+                "when": "Ngay khi bạn không còn chạy thử app Android trong lúc này. Mở lại mất khoảng 10–30 giây (Quick Boot)."}
     e = explain_proc(p["name"], p.get("type", ""), g.get("owner"))
     if e:
         return {"what": e["what"], "why": e["why"], "act": e["act"],
@@ -3131,17 +3137,34 @@ SITE_WEIGHTS = [
 ]
 
 
-def tab_weight(url):
+STREAM_HOST = re.compile(r"flix|phim|movie|film|anime|motchill|hbo|disney|vieon|fptplay|bilibili|iqiyi|wetv|xem|tv360|galaxyplay", re.I)
+STREAM_TITLE = re.compile(r"\b(tập|tap|episode|ep\.?)\s*\d+|vietsub|thuyết minh|lồng tiếng|\(\d{4}\)\s*-|full hd", re.I)
+LOGIN_RE = re.compile(r"(^|[/.])(login|signin|sign-in|sign_in|auth|authn|oauth|accounts?|sso)([/.?#]|$)", re.I)
+LOGIN_TITLE = re.compile(r"sign in|log in|đăng nhập|authentication|xác thực|verify", re.I)
+
+
+def tab_weight(url, title=""):
+    """(MB thấp, MB cao, vì sao, loại) ước tính theo loại trang."""
     u = url or ""
     if re.match(r"^(chrome|brave|edge|arc|about|vivaldi|opera|favorites|safari)[-\w]*:", u) or not u:
-        return 20, 60, "Trang nội bộ của trình duyệt, rất nhẹ."
+        return 20, 60, "Trang nội bộ của trình duyệt, rất nhẹ.", "internal"
     rest = u.split("://", 1)[-1].lower()
     host = rest.split("/", 1)[0].split("?", 1)[0].split("@")[-1]
     hostname = re.sub(r":\d+$", "", host)
+    path = rest[len(host):]
+    if re.search(r"(^|\.)(youtube\.com|youtu\.be)$", hostname):
+        if re.match(r"/(watch|shorts|live)\b", path) or hostname == "youtu.be":
+            return 150, 500, "Video YouTube: trình phát giữ bộ đệm video, quảng cáo, bình luận, danh sách đề xuất; mở càng lâu càng tăng.", "video"
+        return 100, 300, "Trang kênh/trang chủ YouTube: nhiều ảnh thu nhỏ, video tự xem trước khi rê chuột.", "video"
+    if LOGIN_RE.search(hostname) or LOGIN_RE.search(path) or LOGIN_TITLE.search(title or ""):
+        return 40, 120, "Trang đăng nhập/xác thực: thường đã xong việc nhưng vẫn để mở.", "login"
     for pat, lo, hi, why in SITE_WEIGHTS:
         if re.search(pat, hostname) or re.search(pat, rest):
-            return lo, hi, why
-    return 60, 200, "Trang web thông thường."
+            kind = "call" if hi >= 1200 else ("heavy" if hi >= 800 else "site")
+            return lo, hi, why, kind
+    if STREAM_HOST.search(hostname) or STREAM_TITLE.search(title or ""):
+        return 200, 600, "Trang xem phim/video: trình phát, quảng cáo và cửa sổ quảng cáo ẩn rất nặng, kể cả khi đang tạm dừng.", "video"
+    return 60, 200, "Trang web thông thường.", "site"
 
 
 US, RS = "\x1f", "\x1e"
@@ -3248,39 +3271,72 @@ def parse_tab_rows(out, chromium=True):
             js_err = h[4:]
         elif h.strip().lstrip("-").isdigit() and int(h) >= 0:
             heap = int(h)
-        lo, hi, why = tab_weight(u)
+        lo, hi, why, kind = tab_weight(u, ti)
         m = re.match(r"^[a-z]+://([^/?#]+)", u or "")
         tabs.append({"win": wid.strip(), "id": tid.strip(), "idx": idx, "active": act.strip() == "true",
                      "loading": ld.strip() == "true", "title": ti, "url": u, "host": (m.group(1) if m else u)[:80],
-                     "lo": lo * MB, "hi": hi * MB, "why": why, "heap": heap, "js_err": js_err})
+                     "lo": lo * MB, "hi": hi * MB, "why": why, "kind": kind, "heap": heap, "js_err": js_err})
     return tabs
 
 
-def rank_tabs(tabs):
+def site_of(t):
+    h = (t.get("host") or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def rank_tabs(tabs, render_total=0):
+    """Ước tính RAM từng tab (chia tổng RAM tiến trình trang web theo trọng số loại trang, hoặc số đo thật),
+    xếp hạng và đánh dấu tab nên đóng kèm lý do cụ thể."""
     measured = any(t["heap"] is not None for t in tabs)
-    seen = {}
+    seen, per_site = {}, {}
     for t in tabs:
         if t["url"]:
             seen[t["url"]] = seen.get(t["url"], 0) + 1
+        per_site[site_of(t)] = per_site.get(site_of(t), 0) + 1
+    wsum = sum((t["lo"] + t["hi"]) / 2 for t in tabs) or 1
     for t in tabs:
         t["dup"] = seen.get(t["url"], 0) > 1
-        t["score"] = (t["heap"] if t["heap"] is not None else -1) if measured else (t["lo"] + t["hi"]) / 2
-    tabs.sort(key=lambda t: -t["score"])
-    n = 0
-    shown_dup = set()
+        w = (t["lo"] + t["hi"]) / 2
+        t["est"] = int(render_total * w / wsum) if render_total else int(w)
+        t["score"] = (t["heap"] if t["heap"] is not None else -1) if measured else t["est"] + (1 if t["kind"] == "video" else 0)
+    tabs.sort(key=lambda t: (-t["score"], t["idx"]))
+    shown_dup, heavy_n = set(), 0
     for t in tabs:
-        heavy = (t["heap"] or 0) >= 150 * MB if measured else t["hi"] >= 700 * MB
         reasons = []
         if t["dup"]:
             if t["url"] in shown_dup:
                 reasons.append("Trang này đang mở nhiều lần: đóng bản thừa.")
             shown_dup.add(t["url"])
-        if heavy and not t["active"] and n < 3:
-            reasons.append("Nặng nhất trong các tab bạn không xem.")
-            n += 1
+        if not t["active"]:
+            if t["kind"] == "video":
+                reasons.append("Tab video bạn không xem: vẫn giữ bộ đệm video và quảng cáo. Muốn xem sau thì bấm “Lưu” → Xem sau.")
+            elif t["kind"] == "login":
+                reasons.append("Trang đăng nhập đã xong việc; cần thì mở lại.")
+            elif t["kind"] in ("call", "heavy") or (measured and (t["heap"] or 0) >= 150 * MB):
+                reasons.append("Trang nặng mà bạn không xem.")
+            elif heavy_n < 3 and t["score"] >= 250 * MB:
+                reasons.append("Nặng nhất trong các tab bạn không xem.")
+                heavy_n += 1
+            if per_site.get(site_of(t), 0) >= 4 and not reasons:
+                reasons.append(f"Bạn đang mở {per_site[site_of(t)]} tab {site_of(t)}; giữ lại tab cần dùng thôi.")
         t["close"] = bool(reasons) and not t["active"]
         t["reason"] = " ".join(reasons)
     return measured
+
+
+def site_groups(tabs):
+    """Nhóm tab theo trang (≥2 tab) để đóng hàng loạt."""
+    g = {}
+    for t in tabs:
+        k = site_of(t)
+        if not k:
+            continue
+        x = g.setdefault(k, {"site": k, "n": 0, "mem": 0, "closable": 0, "active": False})
+        x["n"] += 1
+        x["mem"] += t["heap"] if t["heap"] is not None else t["est"]
+        x["active"] = x["active"] or t["active"]
+        x["closable"] += 0 if t["active"] else 1
+    return sorted([x for x in g.values() if x["n"] >= 2], key=lambda x: -x["mem"])
 
 
 def browser_tabs(bid, measure=False, groups=None):
@@ -3293,17 +3349,32 @@ def browser_tabs(bid, measure=False, groups=None):
     if r.returncode != 0:
         return _osa_err(r.stderr or "", browser)
     tabs = parse_tab_rows(r.stdout, bid in CHROMIUM_IDS)
-    measured = rank_tabs(tabs)
-    js_off = measure and not measured and any(t["js_err"] for t in tabs)
     g = next((x for x in (groups or proc_snapshot()) if x["bid"] == bid), None)
     rend = sorted([p["mem"] for p in g["procs"] if p["type"] == "renderer"], reverse=True) if g else []
+    rtot = next((b["mem"] for b in g["breakdown"] if b["type"] == "renderer"), sum(rend)) if g else 0
+    measured = rank_tabs(tabs, rtot)
+    js_off = measure and not measured and any(t["js_err"] for t in tabs)
     ext = sum(p["mem"] for p in g["procs"] if p["type"] == "extension") if g else 0
     gpu = sum(p["mem"] for p in g["procs"] if p["type"] == "gpu-process") if g else 0
     for t in tabs:
         t.pop("js_err", None)
     return {"ok": True, "browser": browser, "bid": bid, "tabs": tabs[:200], "count": len(tabs), "measured": measured,
             "js_off": js_off, "can_measure": bid in CHROMIUM_IDS, "renderers": rend[:10], "n_renderers": len(rend),
-            "ext_mem": ext, "gpu_mem": gpu, "total": g["mem"] if g else 0}
+            "ext_mem": ext, "gpu_mem": gpu, "total": g["mem"] if g else 0, "render_total": rtot,
+            "sites": site_groups(tabs), "n_close": sum(1 for t in tabs if t["close"]),
+            "close_mem": sum((t["heap"] if t["heap"] is not None else t["est"]) for t in tabs if t["close"])}
+
+
+def tabs_close_many(bid, items):
+    """Đóng nhiều tab: Safari đóng theo chỉ số nên đi từ cuối lên để chỉ số không lệch."""
+    done, fail = 0, 0
+    items = sorted(items[:200], key=lambda x: (str(x.get("win")), -int(x.get("idx") or 0)))
+    for x in items:
+        r = tab_action(bid, str(x.get("win", "")), str(x.get("id", "")), x.get("idx"), str(x.get("url", "")), "close")
+        done, fail = (done + 1, fail) if r.get("ok") else (done, fail + 1)
+        if r.get("perm"):
+            return dict(r, done=done)
+    return {"ok": True, "done": done, "fail": fail}
 
 
 def tab_action(bid, win, tid, idx, url, action):
@@ -3732,6 +3803,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/tab_act":
             self._json(tab_action(str(body.get("bid", "")), str(body.get("win", "")), str(body.get("id", "")),
                                   body.get("idx"), str(body.get("url", "")), str(body.get("action", ""))))
+        elif path == "/api/tabs_close":
+            self._json(tabs_close_many(str(body.get("bid", "")), list(body.get("tabs", []))))
         elif path == "/api/open_automation":
             run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"], 10)
             self._json({"ok": True})
@@ -4592,14 +4665,17 @@ function tabsHTML(g){
   if(t.error)return `<div class="tabsbox"><b>${esc(t.error)}</b>${t.hint?`<p class="mut">${esc(t.hint)}</p>`:""}${t.perm?`<button class="small" style="margin-left:0" data-act="open_automation">Mở cài đặt Tự động hóa</button>`:""}</div>`;
   const mx=Math.max(1,...t.tabs.map(x=>x.score));
   return `<div class="tabsbox"><p style="margin:0 0 6px"><b>${t.count} tab</b> · ${esc(t.browser)} dùng tổng ${human(t.total)} qua ${t.n_renderers} tiến trình trang web${t.renderers.length?` (nặng nhất: ${t.renderers.slice(0,4).map(human).join(", ")})`:""}${t.ext_mem?` · tiện ích mở rộng ${human(t.ext_mem)}`:""}${t.gpu_mem?` · đồ họa ${human(t.gpu_mem)}`:""}.</p>
-    <p class="mut" style="margin:0 0 8px;font-size:12.5px">${t.measured?"Con số là bộ nhớ JavaScript đo trực tiếp trong từng tab: phần lớn nhất nhưng chưa gồm ảnh/video đang giải mã, nên RAM thật cao hơn một chút.":"Thứ tự theo ước tính từ loại trang (chưa đo). macOS không cho biết tab nào ứng với tiến trình nào, nên muốn số chính xác hãy bấm Đo."}
+    <p class="mut" style="margin:0 0 8px;font-size:12.5px">${t.measured?"Con số là bộ nhớ JavaScript đo trực tiếp trong từng tab: phần lớn nhất nhưng chưa gồm ảnh/video đang giải mã, nên RAM thật cao hơn một chút.":`Ước tính: chia ${human(t.render_total||0)} RAM của các tiến trình trang web theo loại trang (video, phim, mạng xã hội nặng hơn trang thường). macOS không cho biết tab nào ứng với tiến trình nào, nên muốn số chính xác hãy bấm Đo.`}
       ${t.can_measure&&!t.measured?` <button class="link" data-ameasure="${esc(g.key)}">📏 Đo chính xác từng tab</button>`:""}${t.measured?` <button class="link" data-ameasure="${esc(g.key)}">↻ Đo lại</button>`:""}</p>
+    ${t.n_close?`<div class="verd"><b>Gợi ý:</b> đóng <b>${t.n_close} tab</b> được đánh dấu “Nên đóng” (tab đang xem không bị đụng tới), lấy lại khoảng <b>${human(t.close_mem)}</b>.
+      <button class="small" data-aclose="${esc(g.key)}" data-amode="close">Đóng ${t.n_close} tab nên đóng</button></div>`:""}
+    ${t.sites&&t.sites.length?`<div class="chips">${t.sites.map(x=>`<span><b>${esc(x.site)}</b>: ${x.n} tab ≈ ${human(x.mem)}${x.closable?` <button class="link" style="padding:0 2px" data-aclose="${esc(g.key)}" data-amode="site" data-asite="${esc(x.site)}">Đóng ${x.closable} tab${x.active?" (giữ tab đang xem)":""}</button>`:""}</span>`).join("")}</div>`:""}
     ${t.js_off?`<div class="aflag warn">Chưa đo được: ${esc(t.browser)} đang tắt quyền chạy JavaScript từ AppleScript. Bật bằng menu <b>Xem → Nhà phát triển → Cho phép JavaScript từ Apple Events</b> (View → Developer → Allow JavaScript from Apple Events), rồi bấm Đo lại. Spotless Mac chỉ đọc con số bộ nhớ, không đọc nội dung trang. Lưu ý: tab đang ngủ (Tiết kiệm bộ nhớ) có thể bị đánh thức khi đo.</div>`:""}
     ${t.tabs.map((x,i)=>`<div class="tabrow ${x.close?"cl":""}"><span class="rk">${i+1}</span>
       <div class="tt"><b>${esc(x.title||x.url||"(không tên)")}</b><span class="mut">${esc(x.host)}</span>
         ${x.active?` <span class="badge b-safe">đang xem</span>`:""}${x.dup?` <span class="badge b-review">mở trùng</span>`:""}${x.loading?` <span class="badge b-review">đang tải</span>`:""}
         <div class="why">${esc(x.why)}</div>${x.close?`<div class="rs">👉 Nên đóng: ${esc(x.reason)}</div>`:""}</div>
-      <div class="sz">${x.heap!=null?human(x.heap):(t.measured?`<span class="mut">chưa đo được</span>`:`~${human(x.lo)}–${human(x.hi)}`)}<div class="bar"><div style="width:${Math.max(2,x.score/mx*100).toFixed(0)}%"></div></div></div>
+      <div class="sz" title="Khoảng thường gặp cho loại trang này: ${human(x.lo)}–${human(x.hi)}">${x.heap!=null?human(x.heap):(t.measured?`<span class="mut">chưa đo được</span>`:`≈ ${human(x.est)} <span class="mut" style="font-size:11px">ước tính</span>`)}<div class="bar"><div style="width:${Math.max(2,x.score/mx*100).toFixed(0)}%"></div></div></div>
       <div style="white-space:nowrap"><button class="link" data-atabact="focus" data-akey="${esc(g.key)}" data-ai="${i}">Chuyển tới</button><button class="link" style="color:var(--danger)" data-atabact="close" data-akey="${esc(g.key)}" data-ai="${i}">Đóng tab</button></div></div>`).join("")}</div>`;
 }
 async function loadTabs(key,measure){
@@ -4627,6 +4703,14 @@ document.addEventListener("click",async e=>{
     if(!confirm(force?`Buộc thoát ${g.label}?\n\nApp bị tắt ngay, dữ liệu chưa lưu sẽ mất. Chỉ dùng khi app treo hoặc không chịu thoát.`:`Thoát ${g.label}?\n\nGiống bấm ⌘Q: app sẽ hỏi lưu nếu còn tài liệu chưa lưu.`))return;
     const r=await api("/api/app_quit",{bundle:g.bundle,force});toast(r.ok?`✅ Đã yêu cầu ${esc(g.label)} thoát`:`⚠️ ${esc(r.error||"Không thoát được")}`);setTimeout(pollActivity,1500);return}
   const tb=e.target.closest("[data-atabs]");if(tb){loadTabs(tb.dataset.atabs,false);setTimeout(()=>{const el=document.querySelector(`[data-agrp="${CSS.escape(tb.dataset.atabs)}"]`);if(el)el.scrollIntoView({block:"start",behavior:"smooth"})},50);return}
+  const cm=e.target.closest("[data-aclose]");
+  if(cm){const key=cm.dataset.aclose,t=AC.tabs[key],g=gkey(key);if(!t||!g)return;
+    const list=t.tabs.filter(x=>!x.active&&(cm.dataset.amode==="close"?x.close:((x.host||"").replace(/^www\./,"")===cm.dataset.asite)));
+    if(!list.length)return;
+    if(!confirm(`Đóng ${list.length} tab?\n\n${list.slice(0,12).map(x=>"• "+(x.title||x.host)).join("\n")}${list.length>12?"\n…":""}\n\nMở lại tab vừa đóng bằng ⌘⇧T trong trình duyệt (hoặc Lịch sử).`))return;
+    const r=await api("/api/tabs_close",{bid:g.bid,tabs:list.map(x=>({win:x.win,id:x.id,idx:x.idx,url:x.url}))});
+    toast(r.ok?`✅ Đã đóng ${r.done} tab${r.fail?` (${r.fail} tab không đóng được)`:""}`:`⚠️ ${esc(r.error||"Không đóng được")}`);
+    await loadTabs(key,false);setTimeout(pollActivity,1500);return}
   const ms=e.target.closest("[data-ameasure]");if(ms){loadTabs(ms.dataset.ameasure,true);return}
   const ta=e.target.closest("[data-atabact]");
   if(ta){const key=ta.dataset.akey,t=AC.tabs[key],g=gkey(key),x=t&&t.tabs&&t.tabs[+ta.dataset.ai];if(!x||!g)return;

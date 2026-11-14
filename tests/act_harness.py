@@ -49,7 +49,10 @@ TABOUT = (d.RS.join(d.US.join(r) for r in [
     ["1", "11", "1", "false", "false", "", "Video hay - YouTube", "https://www.youtube.com/watch?v=1"],
     ["1", "12", "2", "true", "false", "", "Hộp thư - Gmail", "https://mail.google.com/mail/u/0/"],
     ["1", "13", "3", "false", "false", "", "Figma file", "https://www.figma.com/design/abc"],
-    ["1", "14", "4", "false", "false", "", "Video hay - YouTube", "https://www.youtube.com/watch?v=1"]]) + d.RS)
+    ["1", "14", "4", "false", "false", "", "Video hay - YouTube", "https://www.youtube.com/watch?v=1"],
+    ["1", "15", "5", "false", "false", "", "Sign in to GitHub · GitHub", "https://github.com/login"],
+    ["1", "16", "6", "false", "false", "", "Dâu Tây Ngọt Ngào (2026) - ONFLIX", "https://onflix.lat/phim/dau-tay"],
+    ["1", "17", "7", "false", "false", "", "Week 0 Functions - CS50", "https://cs50.harvard.edu/python/weeks/0/"]]) + d.RS)
 CLOSED = []
 
 
@@ -57,12 +60,14 @@ def fake_tabs(bid, measure=False, groups=None):
     rows = [r for r in d.parse_tab_rows(TABOUT) if r["id"] not in CLOSED]
     if measure:
         for r in rows:
-            r["heap"] = {"11": 300, "12": 120, "13": 90, "14": 280}[r["id"]] * d.MB
-    m = d.rank_tabs(rows)
+            v = {"11": 300, "12": 120, "13": 90, "14": 280}.get(r["id"])
+            r["heap"] = v * d.MB if v else None
     g = next(x for x in d.proc_snapshot() if x["bid"] == bid)
+    m = d.rank_tabs(rows, 800 * 1024 * 1024)
     return {"ok": True, "browser": "Brave", "bid": bid, "tabs": rows, "count": len(rows), "measured": m, "js_off": False,
             "can_measure": True, "renderers": [800 * 1024 * 1024], "n_renderers": 1, "ext_mem": 200 * 1024 * 1024, "gpu_mem": 0,
-            "total": g["mem"]}
+            "total": g["mem"], "render_total": 800 * 1024 * 1024, "sites": d.site_groups(rows),
+            "n_close": sum(1 for t in rows if t["close"]), "close_mem": sum(t["est"] for t in rows if t["close"])}
 
 
 def fake_act(bid, win, tid, idx, url, action):
@@ -71,7 +76,14 @@ def fake_act(bid, win, tid, idx, url, action):
     return {"ok": True}
 
 
+def fake_many(bid, items):
+    for x in items:
+        CLOSED.append(str(x["id"]))
+    return {"ok": True, "done": len(items), "fail": 0}
+
+
 d.browser_tabs = fake_tabs
+d.tabs_close_many = fake_many
 d.tab_action = fake_act
 try:
     d.main()

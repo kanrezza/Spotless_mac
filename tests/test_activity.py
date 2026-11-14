@@ -43,7 +43,7 @@ check(sug and sug[0]["act"]["kind"] == "kill" and sug[0]["act"]["pid"] == 900, "
 r = d.proc_kill(os.getpid(), os.path.basename(sys.executable))
 check(not r["ok"], "không cho buộc dừng chính Spotless Mac")
 check(not d.app_quit("/System/Library/CoreServices/Finder.app")["ok"], "không cho thoát Finder")
-check(d.tab_weight("https://www.youtube.com/watch?v=x")[1] >= 700 and d.tab_weight("brave://newtab")[1] < 100
+check(d.tab_weight("https://www.youtube.com/watch?v=x")[1] >= 500 and d.tab_weight("brave://newtab")[1] < 100
       and d.tab_weight("http://localhost:5173/")[0] == 150, "ước tính tab theo loại trang")
 out = d.US.join(["1", "7", "1", "false", "false", "ERR:off", "A", "https://x.com/"]) + d.RS
 t = d.parse_tab_rows(out)
@@ -65,4 +65,18 @@ s2 = d.activity_suggest(list(g2.values()), mem)
 check(any("Nên đóng" in x["t"] and "qemu" in x["t"] for x in s2), "gợi ý tổng: Nên đóng qemu")
 check(d.verdict({"label": "X", "bid": "", "mem": 2 * d.GB, "cpu": 0.0, "idle": True, "flags": [], "system": False,
                   "browser": "", "self": False}, dict(mem, pressure="warn"))["v"] == "close", "app rảnh 2 GB khi thiếu RAM → Nên đóng")
+rows = [["1", "1", "1", "true", "false", "", "Gmail", "https://mail.google.com/"],
+        ["1", "2", "2", "false", "false", "", "Video", "https://www.youtube.com/watch?v=a"],
+        ["1", "3", "3", "false", "false", "", "Kênh - YouTube", "https://www.youtube.com/@kenh"],
+        ["1", "4", "4", "false", "false", "", "Sign in to GitHub", "https://github.com/login"],
+        ["1", "5", "5", "false", "false", "", "Phim A (2026) - ONFLIX", "https://onflix.lat/phim/a"],
+        ["1", "6", "6", "false", "false", "", "CS50", "https://cs50.harvard.edu/python/"]]
+tb = d.parse_tab_rows(d.RS.join(d.US.join(r) for r in rows) + d.RS)
+d.rank_tabs(tb, 1000 * d.MB)
+k = {t["id"]: t for t in tb}
+check(abs(sum(t["est"] for t in tb) - 1000 * d.MB) < 10 * d.MB, "ước tính chia đúng tổng RAM tiến trình trang web")
+check(k["2"]["close"] and k["5"]["close"] and k["4"]["close"] and not k["1"]["close"], "đề xuất đóng: video, phim, trang đăng nhập; giữ tab đang xem")
+check(not k["6"]["close"] and k["5"]["kind"] == "video" and k["4"]["kind"] == "login", "trang thường nhẹ không bị đề xuất đóng")
+sg = d.site_groups(tb)
+check(sg and sg[0]["site"] == "youtube.com" and sg[0]["n"] == 2, "gom tab theo trang để đóng hàng loạt")
 print(f"\nALL ACTIVITY TESTS PASSED ({n} kiểm tra)")
