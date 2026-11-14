@@ -21,6 +21,18 @@ const ok = m => console.log('✓ ' + m);
   const th = await p.$eval('#o-body', x => x.textContent);
   if (!th.includes('68%') || !th.includes('hạ xung')) fail('nhiệt độ thiếu cảnh báo hạ xung: ' + th.slice(0, 200));
   if (!th.includes('Kê máy')) fail('thiếu lời khuyên hạ nhiệt'); ok('Nhiệt độ: báo hạ xung 68% + lời khuyên');
+  if (!th.includes('Nóng ở đâu')) fail('thiếu bảng nguồn nhiệt');
+  if (!(await p.$('[data-tkill]'))) fail('thiếu nút buộc dừng ngay trong tab Nhiệt độ');
+  if (!(await p.$('[data-ttabs]'))) fail('thiếu nút xem tab ngay trong tab Nhiệt độ');
+  ok('Nhiệt độ: có bảng nguồn nhiệt + nút xử lý tại chỗ');
+  await p.click('[data-ttabs]');
+  await p.waitForSelector('.tabsbox .tabrow', {timeout: 30000});
+  ok('bấm “Xem tab nặng nhất” → mở thẳng danh sách tab');
+  await p.click('[data-tab=optim]');
+  await p.waitForSelector('[data-tkill]', {timeout: 20000});
+  await p.click('[data-tkill]');
+  await p.waitForFunction(() => !document.querySelector('[data-tkill]'), null, {timeout: 20000});
+  ok('buộc dừng tiến trình kẹt ngay tại tab Nhiệt độ');
   await p.screenshot({path: `${OUT}/deep-thermal.png`, fullPage: true});
 
   await p.click('[data-osub=net]');

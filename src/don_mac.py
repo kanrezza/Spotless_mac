@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "6.1.1"
+VERSION = "6.2.0"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -4934,6 +4934,32 @@ def parse_therm(text):
     return out
 
 
+def heat_sources(groups, limit=6):
+    """App/tiến trình đang bắt CPU chạy nhiều nhất — kèm sẵn cách xử lý ngay tại chỗ."""
+    out = []
+    for g in sorted(groups, key=lambda x: -x.get("cpu", 0))[:limit]:
+        cpu = g.get("cpu", 0)
+        if cpu < 8 and len(out) >= 3:
+            break
+        if cpu < 1:
+            break
+        procs = g.get("procs") or []
+        stuck = next((p for p in procs if any(f["lv"] == "bad" for f in p["flags"]) and p.get("killable")), None)
+        hottest = max(procs, key=lambda p: p["cpu"]) if procs else None
+        info = g.get("info") or {}
+        out.append({"key": g["key"], "label": g["label"], "cpu": cpu, "avg": g.get("avg", 0),
+                    "system": g.get("system", False), "browser": g.get("browser", ""), "bid": g.get("bid", ""),
+                    "bundle": g.get("bundle", ""), "can_quit": g.get("can_quit", False),
+                    "why": info.get("why", ""), "act": info.get("act", ""),
+                    "kill": {"pid": stuck["pid"], "name": stuck["name"], "cpu": stuck["cpu"]} if stuck else None,
+                    "hot_proc": (hottest["name"] if hottest and len(procs) > 1 and hottest["name"] != g["label"] else ""),
+                    "share": None})
+    tot = sum(x["cpu"] for x in out) or 1
+    for x in out:
+        x["share"] = x["cpu"] / tot * 100
+    return out
+
+
 def thermal(groups=None, therm_text=None, batt=None):
     t = parse_therm(therm_text if therm_text is not None else sh(["pmset", "-g", "therm"]))
     speed = t.get("CPU_Speed_Limit")
@@ -4989,8 +5015,10 @@ def thermal(groups=None, therm_text=None, batt=None):
     if speed is None:
         note += (" Trên máy chip Apple (M1/M2/M3…), macOS thường không báo chỉ số “tốc độ CPU” qua pmset, nên ô đó để trống "
                  "là bình thường; lúc đó dấu hiệu máy bị ép chạy chậm vì nóng là kernel_task vọt lên hàng trăm phần trăm.")
+    total_cpu = min(100.0, sum(g.get("cpu", 0) for g in groups) / ncpu)
     return {"state": state, "lv": lv, "msg": msg, "temp": temp, "speed": speed, "sched": sched,
-            "avail": avail, "ncpu": ncpu, "kernel_task": kt, "raw": t, "hot": hot, "tips": tips, "note": note}
+            "avail": avail, "ncpu": ncpu, "kernel_task": kt, "raw": t, "hot": hot, "tips": tips, "note": note,
+            "sources": heat_sources(groups), "cpu": round(total_cpu, 1)}
 
 
 # ---- mạng theo app
@@ -6289,6 +6317,7 @@ function infoBox(i,risk){
 }
 function renderActivity(){
   const r=AC.data;if(!r)return;
+  if(AC.pendingTabs){const k=AC.pendingTabs;AC.pendingTabs=null;if(r.groups.some(g=>g.key===k)){loadTabs(k,false);return}}
   for(const b of document.querySelectorAll("[data-asort]"))b.classList.toggle("on",b.dataset.asort===AC.sort);
   $("apause").textContent=AC.paused?"▶ Tiếp tục":"⏸ Tạm dừng";
   $("astamp").textContent=AC.paused?"Đã tạm dừng":"Cập nhật mỗi 3 giây";
@@ -6581,6 +6610,17 @@ document.addEventListener("click",async e=>{
   const os=e.target.closest("[data-osub]");if(os){setOsub(os.dataset.osub);return}
   const ga=e.target.closest("[data-goact]");if(ga){AC.open.add(ga.dataset.goact);setTab("activity");return}
   const ou=e.target.closest("[data-ourl]");if(ou){api("/api/open_url",{url:ou.dataset.ourl});return}
+  const tk=e.target.closest("[data-tkill]");
+  if(tk){if(!confirm(`Buộc dừng “${tk.dataset.tname}” (PID ${tk.dataset.tkill})?\n\nTiến trình này đang bị kẹt và đốt CPU. App chủ vẫn chạy bình thường.`))return;
+    const r=await api("/api/proc_kill",{pid:+tk.dataset.tkill,name:tk.dataset.tname});
+    toast(r.ok?`✅ Đã dừng ${esc(tk.dataset.tname)}`:`⚠️ ${esc(r.error||"Không dừng được")}`);OP.thermal=null;setOsub("thermal");return}
+  const tq=e.target.closest("[data-tquit]");
+  if(tq){if(!confirm(`Thoát ${tq.dataset.tlabel}?\n\nGiống bấm ⌘Q: app sẽ hỏi lưu nếu còn tài liệu chưa lưu.`))return;
+    const r=await api("/api/app_quit",{bundle:tq.dataset.tquit});
+    toast(r.ok?`✅ Đã yêu cầu ${esc(tq.dataset.tlabel)} thoát`:`⚠️ ${esc(r.error||"Không thoát được")}`);
+    setTimeout(()=>{OP.thermal=null;if(OP.sub==="thermal")setOsub("thermal")},1500);return}
+  const tt=e.target.closest("[data-ttabs]");
+  if(tt){AC.pendingTabs=tt.dataset.ttabs;setTab("activity");return}
   const ud=e.target.closest("[data-oundo]");
   if(ud){if(!confirm("Đưa các mục của lần dọn này từ Thùng rác về chỗ cũ?\n\nMục nào đã bị dọn khỏi Thùng rác, hoặc chỗ cũ đã có tệp khác, sẽ được bỏ qua."))return;
     const r=await api("/api/undo_do",{batch:ud.dataset.oundo});
@@ -6621,8 +6661,25 @@ function renderThermal(){
       <div class="bx"><span class="mut">Nhân CPU dùng được</span><b>${t.avail!=null?t.avail+"/"+t.ncpu:t.ncpu}</b><span class="mut">${t.kernel_task>=50?"kernel_task "+num(t.kernel_task,0)+"%":"bình thường"}</span></div></div>
     ${t.tips.map(x=>`<div class="aflag ${t.lv==="bad"?"bad":"warn"}">💡 ${esc(x)}</div>`).join("")}
     <p class="k" style="margin-top:8px">${esc(t.note)}</p></div>
-  ${t.hot.length?`<div class="card"><h2>Đang làm máy nóng</h2><table class="mini"><tr><th>App</th><th class="r">CPU</th><th></th></tr>
-    ${t.hot.map(h=>`<tr><td><b>${esc(h.label)}</b></td><td class="num">${num(h.cpu)}%</td><td class="r"><button class="link" data-goact="${esc(h.key)}">Chi tiết</button></td></tr>`).join("")}</table></div>`:""}`;
+  ${heatHTML(t)}`;
+}
+function heatHTML(t){
+  const S=t.sources||[];
+  if(!S.length)return `<div class="card"><h2>Nguồn nhiệt</h2><p class="k">Không app nào đang bắt CPU chạy nhiều. Máy nóng lúc này nhiều khả năng do môi trường (phòng nóng, nắng, kê trên chăn gối) hoặc đang sạc.</p></div>`;
+  const mx=Math.max(1,...S.map(x=>x.cpu));
+  return `<div class="card"><h2>Nóng ở đâu — và đóng gì</h2>
+    <p class="k">Xếp theo CPU đang dùng; CPU là thứ sinh nhiệt chính. Tổng CPU của máy lúc này ${num(t.cpu)}% (${t.ncpu} nhân). Bấm ngay nút bên phải để xử lý, không cần sang tab khác.</p>
+    ${S.map(h=>`<div class="ock" style="grid-template-columns:1fr auto">
+      <div><b>${esc(h.label)}</b> <span class="badge ${h.kill?"b-careful":h.system?"b-mute":"b-info"}">${h.kill?"có tiến trình kẹt":h.system?"thành phần macOS":"app của bạn"}</span>
+        <div class="astats" style="margin:4px 0 6px"><span>CPU lúc này <b>${num(h.cpu)}%</b></span>${h.avg?`<span>trung bình <b>${num(h.avg)}%</b></span>`:""}
+          <span>chiếm <b>${num(h.share,0)}%</b> phần CPU đang bị dùng</span>${h.hot_proc?`<span>tiến trình nặng nhất: <b>${esc(h.hot_proc)}</b></span>`:""}</div>
+        <div class="bar" style="margin:0 0 6px"><div style="width:${(h.cpu/mx*100).toFixed(0)}%;background:var(--${h.kill?"careful":"accent"})"></div></div>
+        ${h.why?`<p class="vt">${esc(h.why)}</p>`:""}${h.act?`<p class="fx">👉 ${esc(h.act)}</p>`:""}</div>
+      <div style="display:flex;flex-direction:column;gap:6px;align-items:stretch;min-width:150px">
+        ${h.kill?`<button class="small" style="margin-left:0;background:var(--danger)" data-tkill="${h.kill.pid}" data-tname="${esc(h.kill.name)}">Buộc dừng ${esc(h.kill.name)}</button>`:""}
+        ${h.browser?`<button class="small" style="margin-left:0" data-ttabs="${esc(h.key)}">Xem tab nặng nhất</button>`:""}
+        ${h.can_quit?`<button class="small" style="margin-left:0" data-tquit="${esc(h.bundle)}" data-tlabel="${esc(h.label)}">Thoát ${esc(h.label)}</button>`:""}
+        <button class="link" data-goact="${esc(h.key)}">Xem tiến trình</button></div></div>`).join("")}</div>`;
 }
 function renderNet(){
   const n=OP.net;if(!n)return spinCard("Đang đo lưu lượng mạng (vài giây)…");

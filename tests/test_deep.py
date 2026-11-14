@@ -136,6 +136,21 @@ t4 = d.thermal([{"label": "WindowServer", "cpu": 65.0, "key": "w", "procs": [], 
 check(t4["state"] == "ok" and "WindowServer" in t4["msg"] and any("không đóng được" in x for x in t4["tips"]),
       "tiến trình hệ thống nặng: không bảo buộc dừng, nói đúng cách xử lý")
 check("chip Apple" in d.thermal([], "", None)["note"], "máy chip Apple không báo tốc độ CPU → giải thích")
+me2 = d.me_user()
+PS2 = f"""900 1 {me2} 12000 171.2 2-04:00:00 440:49.03 /Applications/Claude.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler
+901 1 {me2} 400000 2.7 03:00:00 22:54.65 /Applications/Claude.app/Contents/MacOS/Claude
+41896 1 {me2} 300000 65.0 01:00:00 34.35 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser
+401 1 _windowserver 500000 64.6 9-00:00:00 1535:07.60 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+"""
+G2 = d.proc_snapshot(PS2, "", None)
+t5 = d.thermal(G2, "", {"temp": 30})
+src = {x["label"]: x for x in t5["sources"]}
+check(len(t5["sources"]) >= 3 and t5["cpu"] > 0, "luôn liệt kê nguồn nhiệt kèm tổng CPU")
+check(src["Claude"]["kill"] and src["Claude"]["kill"]["name"] == "chrome_crashpad_handler", "Claude: đưa sẵn nút buộc dừng tiến trình kẹt")
+check(src["Brave Browser"]["browser"] and src["Brave Browser"]["can_quit"], "Brave: có nút xem tab và thoát app")
+check(src["WindowServer"]["system"] and not src["WindowServer"]["can_quit"] and src["WindowServer"]["why"],
+      "WindowServer: không cho thoát, vẫn giải thích vì sao nặng")
+check(all(x["share"] is not None and x["act"] for x in t5["sources"]), "mỗi nguồn nhiệt có %% phần CPU và việc nên làm")
 
 # ---------- quyền riêng tư
 db = os.path.join(HOME, "Library/Application Support/com.apple.TCC")
