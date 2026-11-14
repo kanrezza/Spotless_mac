@@ -107,6 +107,41 @@ with open(os.path.join(d.DATA_DIR, "metrics.jsonl"), "w") as f:
 d.record_scan([{"cat": "caches", "size": 1e9}])
 d.record_scan([{"cat": "caches", "size": 4e9}])
 d.log_history([{"t": _t.time() - 86400 * 8, "label": "a", "size": 2e9, "mode": "trash"}, {"t": _t.time() - 3600, "label": "b", "size": 7e8, "mode": "trash"}])
+# --- 006: nhiệt độ, mạng, quyền riêng tư, dọn sâu, hoàn tác (dữ liệu giả)
+_orig_therm = d.thermal
+d.thermal = lambda groups=None, therm_text=None, batt=None: _orig_therm(
+    groups, "CPU_Scheduler_Limit = 100\nCPU_Available_CPUs = 1\nCPU_Speed_Limit = 68", None)
+_NT = """time,name,bytes_in,bytes_out
+00:00:01,Brave Browser.41896,1000,200
+00:00:01,Claude.70583,500,100
+time,name,bytes_in,bytes_out
+00:00:02,Brave Browser.41896,8000000,900
+00:00:02,Claude.70583,900,100
+"""
+_orig_net = d.net_apps
+d.net_apps = lambda groups=None, text=None, secs=1.0: _orig_net(groups, _NT, 1.0)
+import sqlite3 as _sq
+_tcc = os.path.join(H, "Library/Application Support/com.apple.TCC"); os.makedirs(_tcc, exist_ok=True)
+_c = _sq.connect(os.path.join(_tcc, "TCC.db"))
+_c.execute("CREATE TABLE IF NOT EXISTS access (service TEXT, client TEXT, client_type INT, auth_value INT, last_modified INT)")
+_c.executemany("INSERT INTO access VALUES (?,?,?,?,?)", [
+    ("kTCCServiceScreenCapture", "com.hangx.ghost", 0, 2, 1700000000),
+    ("kTCCServiceAccessibility", "com.raycast.macos", 0, 2, 1700000000),
+    ("kTCCServiceMicrophone", "us.zoom.xos", 0, 2, 1700000000)])
+_c.commit(); _c.close()
+for _r, _mb in (("Library/Android/sdk/ndk/26.1.1", 40), ("Library/Android/sdk/system-images/android-30", 45),
+                (".gradle/caches/modules-2", 35), (".gradle/caches/build-cache-1", 30),
+                (".android/avd/Pixel.avd/snapshots/default", 50), (".npm/_cacache", 25)):
+    _dir = os.path.join(H, _r); os.makedirs(_dir, exist_ok=True)
+    with open(os.path.join(_dir, "f.bin"), "wb") as _f:
+        _f.write(b"\0" * (_mb * 1024 * 1024))
+_old = os.path.join(H, "Projects/khac/node_modules"); os.makedirs(_old, exist_ok=True)
+d.STATE["items"] = [{"cat": "envs", "label": "node_modules", "size": 900 * 1024 * 1024, "path": _old,
+                     "mtime": _t.time() - 200 * 86400}]
+d.log_history([{"t": int(_t.time()) - 600, "label": "node_modules (dự án cũ)", "size": 900 * 1024 * 1024,
+                "path": "~/Projects/cu/node_modules", "mode": "trash", "kind": "path", "src": "manual",
+                "batch": "demo1234", "moved": [[os.path.join(H, "Projects/cu/node_modules"), os.path.join(d.TRASH, "node_modules")]]}])
+os.makedirs(d.TRASH, exist_ok=True); os.makedirs(os.path.join(d.TRASH, "node_modules"), exist_ok=True)
 d.browser_tabs = fake_tabs
 d.tabs_close_many = fake_many
 d.tab_action = fake_act

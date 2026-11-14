@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "6.0.0"
+VERSION = "6.1.0"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -1433,8 +1433,11 @@ def remove_path(p):
     return not os.path.lexists(p)
 
 
+MOVED = []  # [(đường dẫn gốc, đường dẫn trong Thùng rác)] của thao tác đang chạy, dùng cho Hoàn tác
+
+
 def move_to_trash(p):
-    """Đổi tên vào ~/.Trash (cùng ổ đĩa, không sao chép)."""
+    """Đổi tên vào ~/.Trash (cùng ổ đĩa, không sao chép). Ghi lại cặp đường dẫn để hoàn tác."""
     name = os.path.basename(p.rstrip("/"))
     dest = os.path.join(TRASH, name)
     if os.path.lexists(dest):
@@ -1447,6 +1450,8 @@ def move_to_trash(p):
             i += 1
     os.makedirs(TRASH, exist_ok=True)
     os.rename(p, dest)
+    MOVED.append((p, dest))
+    return dest
 
 
 def finder_trash(p):
@@ -1582,6 +1587,7 @@ def delete_one(it, mode):
 
 def do_delete(ids, mode, src="manual"):
     results, hist = [], []
+    batch = uuid.uuid4().hex[:12]
     blocked = dup_blocked(ids)
     BUSY[0] += 1
     try:
@@ -1602,20 +1608,26 @@ def do_delete(ids, mode, src="manual"):
             if not it:
                 results.append({"id": i, "ok": False, "msg": "Không tìm thấy mục này, hãy quét lại"})
                 continue
+            MOVED.clear()
             try:
                 ok, msg = delete_one(it, mode)
             except Exception as e:
                 ok, msg = False, str(e)
+            moved = list(MOVED)
+            MOVED.clear()
             if ok:
                 with LOCK:
                     ITEMS.pop(i, None)
                     STATE["items"] = [x for x in STATE["items"] if x["id"] != i]
                 if it.get("path") and it["kind"] in ("path", "app"):
                     forget_path(it["path"])
-                hist.append({"t": int(time.time()), "label": it["label"], "size": it.get("size"),
-                             "path": home_short(it["path"]) if it.get("path") else None,
-                             "mode": mode if it["kind"] not in ALWAYS_PERMANENT else "permanent",
-                             "kind": it["kind"], "src": src})
+                row = {"t": int(time.time()), "label": it["label"], "size": it.get("size"),
+                       "path": home_short(it["path"]) if it.get("path") else None,
+                       "mode": mode if it["kind"] not in ALWAYS_PERMANENT else "permanent",
+                       "kind": it["kind"], "src": src, "batch": batch}
+                if moved:
+                    row["moved"] = [list(x) for x in moved]
+                hist.append(row)
             results.append({"id": i, "ok": ok, "msg": msg, "label": it["label"], "size": it["size"]})
     finally:
         BUSY[0] -= 1
@@ -4602,6 +4614,579 @@ def trends(days=30):
             "freed": sorted(weeks.values(), key=lambda w: w["week"])[-12:], "now": now}
 
 
+# ------------------------------------------------------------------ 006: hoàn tác, dọn sâu cho dev, nhiệt độ, mạng, quyền riêng tư
+def _hist_groups(rows):
+    """Gom lịch sử theo từng lần dọn (batch)."""
+    undone = {r.get("batch") for r in rows if r.get("kind") == "undo"}
+    g = {}
+    for r in rows:
+        b = r.get("batch")
+        if not b or r.get("kind") == "undo":
+            continue
+        x = g.setdefault(b, {"batch": b, "t": r["t"], "n": 0, "size": 0, "labels": [], "can": 0, "can_size": 0,
+                             "gone": 0, "blocked": 0, "undone": b in undone, "src": r.get("src", "manual")})
+        x["t"] = max(x["t"], r["t"])
+        x["n"] += 1
+        x["size"] += r.get("size") or 0
+        if len(x["labels"]) < 4:
+            x["labels"].append(r.get("label") or "")
+        for pair in r.get("moved") or []:
+            if len(pair) != 2:
+                continue
+            orig, dest = pair
+            if not os.path.lexists(dest):
+                x["gone"] += 1
+            elif os.path.lexists(orig):
+                x["blocked"] += 1
+            else:
+                x["can"] += 1
+                x["can_size"] += r.get("size") or 0
+    return sorted(g.values(), key=lambda x: -x["t"])
+
+
+def undo_list(limit=25):
+    return _hist_groups(read_history(2000))[:limit]
+
+
+def undo_batch(batch):
+    """Đưa các file của một lần dọn từ Thùng rác về đúng chỗ cũ."""
+    rows = [r for r in read_history(5000) if r.get("batch") == batch and r.get("moved")]
+    if not rows:
+        return {"ok": False, "error": "Không tìm thấy lần dọn này, hoặc lần đó đã xóa vĩnh viễn (không hoàn tác được)."}
+    done, size, skipped = 0, 0, []
+    for r in rows:
+        for pair in r.get("moved") or []:
+            if len(pair) != 2:
+                continue
+            orig, dest = pair
+            name = os.path.basename(orig.rstrip("/")) or orig
+            if not (dest.startswith(TRASH + "/") and orig.startswith(HOME + "/")):
+                skipped.append(f"{name}: đường dẫn không hợp lệ")
+                continue
+            if not os.path.lexists(dest):
+                skipped.append(f"{name}: không còn trong Thùng rác (đã dọn Thùng rác hoặc đã đổi tên)")
+                continue
+            if os.path.lexists(orig):
+                skipped.append(f"{name}: chỗ cũ đã có tệp khác, không ghi đè")
+                continue
+            try:
+                os.makedirs(os.path.dirname(orig), exist_ok=True)
+                os.rename(dest, orig)
+            except OSError as e:
+                skipped.append(f"{name}: {e}")
+                continue
+            done += 1
+            size += r.get("size") or 0
+            forget_path(orig)
+    if done:
+        log_history([{"t": int(time.time()), "kind": "undo", "batch": batch, "mode": "restore", "src": "undo",
+                      "label": f"Hoàn tác {done} mục", "size": size}])
+    return {"ok": done > 0, "done": done, "size": size, "skipped": skipped[:20],
+            "error": "" if done else "Không khôi phục được mục nào." }
+
+
+# ---- dọn sâu cho công cụ lập trình
+_VER_RE = re.compile(r"(\d+)")
+
+
+def ver_key(name):
+    return [int(x) for x in _VER_RE.findall(name)[:4]] or [0]
+
+
+def dev_old_dirs(root, keep=1):
+    """Các thư mục con dạng phiên bản trong root, trả về (bản cũ, bản giữ lại)."""
+    kids = [n for n in listdir(root) if os.path.isdir(os.path.join(root, n)) and not n.startswith(".")]
+    if len(kids) <= keep:
+        return [], kids
+    kids.sort(key=ver_key)
+    return [os.path.join(root, n) for n in kids[:-keep]], kids[-keep:]
+
+
+def scan_dev_deep(step):
+    with LOCK:
+        for k in [k for k, v in TOOL_ITEMS.items() if v.get("cat") == "dev2"]:
+            TOOL_ITEMS.pop(k, None)
+    items = []
+
+    def row(group, label, size, path=None, risk="review", note="", extra=None, advice=None, cmd=None, kind="path"):
+        if not size or size < 20 * MB:
+            return
+        add(items, "dev2", label, size, path=path, cmd=cmd, kind=kind, risk=risk, note=note, extra=extra,
+            advice=advice, mtime=mtime_of(path) if path else None)
+        if items and items[-1]["label"] == label:
+            items[-1]["group"] = group
+
+    def one(group, rel, label, risk, advice, abs_path=None):
+        p = abs_path or _p(rel)
+        if os.path.isdir(p):
+            row(group, label, du(p), p, risk=risk, note=home_short(p), advice=advice)
+
+    def olds(group, root, label, keep, advice, risk="safe"):
+        if not os.path.isdir(root):
+            return
+        old, kept = dev_old_dirs(root, keep)
+        if not old:
+            return
+        sizes = du_many(old)
+        row(group, f"{label}: {len(old)} bản cũ", sum(sizes), old[0], risk=risk, extra=old[1:],
+            note=f"{home_short(root)} · giữ lại {', '.join(kept)}", advice=advice)
+
+    # ----- Gradle
+    step("Đang kiểm tra Gradle…")
+    gr = _p(".gradle")
+    if os.path.isdir(gr):
+        one("Gradle", ".gradle/caches/modules-2", "Thư viện đã tải (modules-2)", "safe",
+            A("Kho thư viện Gradle tải về cho mọi project Android/Java trên máy (androidx, kotlin, firebase…).",
+              "Toàn bộ: lần build sau Gradle tải lại đúng những gì project cần.",
+              "Lần build kế tiếp phải có mạng và sẽ lâu hơn vài phút.",
+              "Nên xóa khi đang rảnh và có mạng tốt, đừng xóa ngay trước lúc cần build gấp.",
+              "Khi thư mục vượt vài GB và bạn không build gấp. Vài tháng một lần là hợp lý."))
+        one("Gradle", ".gradle/caches/build-cache-1", "Build cache", "safe",
+            A("Kết quả biên dịch được Gradle lưu lại để build lần sau nhanh hơn.", "Toàn bộ.",
+              "Lần build sau chậm hơn một chút; không ảnh hưởng mã nguồn.", "",
+              "Bất cứ lúc nào cần chỗ."))
+        tr = [os.path.join(gr, "caches", n) for n in listdir(os.path.join(gr, "caches"))
+              if n.startswith(("transforms", "jars-", "journal-"))]
+        if tr:
+            row("Gradle", "Cache biến đổi (transforms, jars)", sum(du_many(tr)), tr[0], risk="safe", extra=tr[1:],
+                note=home_short(os.path.join(gr, "caches")),
+                advice=A("Bản đã giải nén/biến đổi của các thư viện (AAR → JAR, lớp đã xử lý).",
+                         "Toàn bộ: Gradle tạo lại khi build.", "Lần build sau lâu hơn một chút.", "",
+                         "Khi cần chỗ, hoặc khi build báo lỗi lạ nghi cache hỏng."))
+        olds("Gradle", os.path.join(gr, "wrapper/dists"), "Bản Gradle đã tải", 1,
+             A("Mỗi project chỉ định một phiên bản Gradle riêng; Gradle Wrapper tải về và giữ lại tất cả (mỗi bản 100–250 MB).",
+               "Các bản cũ không project nào còn dùng.",
+               "Nếu còn project dùng đúng bản cũ đó, lần build sau sẽ tải lại bản ấy.",
+               "Giữ lại bản mới nhất là đủ cho hầu hết trường hợp.",
+               "Sau khi đã nâng các project lên Gradle mới."))
+        vc = [os.path.join(gr, "caches", n) for n in listdir(os.path.join(gr, "caches"))
+              if re.fullmatch(r"\d+(\.\d+)+", n)]
+        if len(vc) > 1:
+            vc.sort(key=ver_key)
+            old = vc[:-1]
+            row("Gradle", f"Cache của {len(old)} phiên bản Gradle cũ", sum(du_many(old)), old[0], risk="safe",
+                extra=old[1:], note=f"giữ lại {os.path.basename(vc[-1])}",
+                advice=A("Mỗi phiên bản Gradle có thư mục cache riêng trong ~/.gradle/caches.",
+                         "Cache của các phiên bản bạn không còn dùng.", "Không ảnh hưởng project.", "",
+                         "Sau khi đã nâng Gradle lên bản mới."))
+        for rel, lab, ad in ((".gradle/daemon", "Nhật ký Gradle Daemon",
+                              A("Log của tiến trình Gradle chạy nền.", "Toàn bộ.", "Mất log để tra lỗi build cũ.", "",
+                                "Bất cứ lúc nào.")),
+                             (".gradle/native", "Thư viện native của Gradle",
+                              A("File hỗ trợ chạy Gradle trên máy.", "Toàn bộ: tự tải lại.",
+                                "Lần build đầu sau đó chậm hơn.", "", "Khi cần chỗ."))):
+            one("Gradle", rel, lab, "safe", ad)
+
+    # ----- Android SDK
+    step("Đang kiểm tra Android SDK…")
+    sdk = next((p for p in (_p("Library/Android/sdk"), _p("Android/Sdk"), os.environ.get("ANDROID_HOME") or "")
+                if p and os.path.isdir(p)), None)
+    if sdk:
+        for rel, lab, risk, ad in (
+            ("system-images", "System image (máy ảo Android)", "careful",
+             A("Ảnh hệ điều hành Android cho máy ảo (Emulator). Mỗi bản API 1,5–3 GB.",
+               "Những API bạn không còn tạo máy ảo để test.",
+               "Máy ảo đang dùng ảnh đó sẽ không chạy được cho tới khi tải lại.",
+               "Xóa qua Android Studio → SDK Manager → SDK Tools để SDK biết; xóa ở đây cũng được nhưng nên mở SDK Manager sau đó.",
+               "Khi bạn chỉ còn test trên 1–2 phiên bản Android.")),
+            ("ndk", "NDK (bộ biên dịch C/C++)", "careful",
+             A("Native Development Kit, chỉ cần nếu project có mã C/C++. Mỗi bản 3–6 GB.",
+               "Các bản NDK không project nào khai báo.",
+               "Project có mã native sẽ báo thiếu NDK và phải tải lại.",
+               "Kiểm tra build.gradle xem có khai báo ndkVersion không.",
+               "Khi bạn không làm project nào dùng C/C++.")),
+            ("sources", "Mã nguồn Android (sources)", "safe",
+             A("Mã nguồn của các API Android, chỉ dùng để nhảy vào xem code trong Android Studio.",
+               "Toàn bộ: chỉ mất tiện ích xem mã nguồn.", "Bấm vào lớp hệ thống sẽ hiện mã đã dịch ngược thay vì mã gốc.",
+               "", "Khi cần chỗ.")),
+            ("docs", "Tài liệu Android", "safe",
+             A("Tài liệu API bản offline.", "Toàn bộ: xem online được.", "Không ảnh hưởng build.", "", "Khi cần chỗ."))):
+            p = os.path.join(sdk, rel)
+            if os.path.isdir(p):
+                kids = [os.path.join(p, n) for n in listdir(p)]
+                sizes = du_many(kids) if kids else []
+                for k, sz in sorted(zip(kids, sizes), key=lambda x: -x[1])[:12]:
+                    row("Android SDK", f"{lab}: {os.path.basename(k)}", sz, k, risk=risk,
+                        note=home_short(k), advice=ad)
+        olds("Android SDK", os.path.join(sdk, "build-tools"), "Build-tools", 1,
+             A("Bộ công cụ đóng gói APK; Android Studio tải thêm mỗi khi project cần bản khác.",
+               "Các bản cũ hơn bản mới nhất.", "Project ghim đúng bản cũ (buildToolsVersion) sẽ phải tải lại.",
+               "", "Sau khi các project đã dùng build-tools mới."))
+        olds("Android SDK", os.path.join(sdk, "platforms"), "Platform (API)", 2,
+             A("Thư viện biên dịch của từng phiên bản Android (android.jar).",
+               "Các API cũ hơn hai bản mới nhất.", "Project đặt compileSdk vào API cũ sẽ phải tải lại (vài chục MB).",
+               "", "Khi bạn không còn build cho API cũ."), risk="review")
+    one("Android SDK", ".android/cache", "Cache của Android Studio (~/.android/cache)", "safe",
+        A("Cache tạm của công cụ Android.", "Toàn bộ.", "Không mất gì, tự tạo lại.", "", "Bất cứ lúc nào."))
+
+    # ----- máy ảo Android: snapshot
+    avd = _p(".android/avd")
+    snaps = [os.path.join(avd, n, "snapshots") for n in listdir(avd) if n.endswith(".avd")]
+    snaps = [p for p in snaps if os.path.isdir(p)]
+    for p in snaps:
+        row("Máy ảo Android", f"Snapshot của {os.path.basename(os.path.dirname(p))[:-4]}", du(p), p, risk="safe",
+            note=home_short(p),
+            advice=A("Ảnh chụp trạng thái máy ảo để lần sau mở nhanh (Quick Boot). Thường 1–3 GB mỗi máy ảo.",
+                     "Toàn bộ: máy ảo vẫn còn, chỉ khởi động lại từ đầu (chậm hơn 10–30 giây).",
+                     "Mất trạng thái đang mở dở trong máy ảo (app đang chạy, dữ liệu chưa lưu).",
+                     "Tắt Emulator trước khi xóa.",
+                     "Khi cần chỗ, hoặc khi máy ảo khởi động lỗi."))
+
+    # ----- Docker / OrbStack
+    step("Đang kiểm tra Docker / OrbStack…")
+    if shutil.which("docker"):
+        r = run(["docker", "images", "--format", "{{json .}}", "--filter", "dangling=false"], 60)
+        used = set()
+        rc = run(["docker", "ps", "-a", "--format", "{{.Image}}"], 60)
+        if rc and rc.returncode == 0:
+            used = {x.strip() for x in rc.stdout.splitlines() if x.strip()}
+        imgs = []
+        for ln in (r.stdout.splitlines() if r and r.returncode == 0 else []):
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            tag = f"{d.get('Repository')}:{d.get('Tag')}"
+            imgs.append((tag, d.get("ID", ""), parse_docker_size(d.get("Size")), tag in used, d.get("CreatedSince", "")))
+        for tag, iid, sz, inuse, age in sorted(imgs, key=lambda x: -x[2])[:20]:
+            if inuse:
+                continue
+            row("Docker / OrbStack", f"Image {tag}", sz, cmd=["docker", "rmi", iid], kind="cmd", risk="review",
+                note=f"ID {iid} · tạo {age} · không container nào dùng",
+                advice=A(f"Image Docker “{tag}” nằm trong ổ đĩa ảo của OrbStack/Docker Desktop.",
+                         "Image này: hiện không container nào dùng.",
+                         "Lần chạy sau phải tải (docker pull) hoặc build lại, có thể mất nhiều phút.",
+                         "Muốn dọn gọn một lần: docker system prune -a (xóa mọi image không dùng).",
+                         "Khi bạn đã xong project dùng image đó, hoặc image là bản thử nghiệm cũ."))
+    one("Docker / OrbStack", ".orbstack/log", "Nhật ký OrbStack", "safe",
+        A("Log của OrbStack.", "Toàn bộ.", "Mất thông tin tra lỗi cũ.", "", "Bất cứ lúc nào."))
+
+    # ----- Node / web
+    step("Đang kiểm tra Node, Python và các cache khác…")
+    for group, rel, lab, risk, ad in (
+        ("Node.js", ".npm/_cacache", "npm cache", "safe", ("npm", "npm install")),
+        ("Node.js", "Library/pnpm/store", "pnpm store", "safe", ("pnpm", "pnpm install")),
+        ("Node.js", ".pnpm-store", "pnpm store (cũ)", "safe", ("pnpm", "pnpm install")),
+        ("Node.js", "Library/Caches/Yarn", "Yarn cache", "safe", ("Yarn", "yarn install")),
+        ("Node.js", ".bun/install/cache", "Bun cache", "safe", ("Bun", "bun install")),
+        ("Node.js", "Library/Caches/deno", "Deno cache", "safe", ("Deno", "deno cache")),
+        ("Node.js", ".cache/puppeteer", "Chromium của Puppeteer", "review", ("Puppeteer", "lệnh cài lại")),
+        ("Node.js", "Library/Caches/ms-playwright", "Trình duyệt của Playwright", "review", ("Playwright", "playwright install")),
+        ("Node.js", ".electron", "Bản Electron đã tải", "safe", ("Electron", "lệnh build")),
+        ("Node.js", ".cache/electron", "Bản Electron đã tải", "safe", ("Electron", "lệnh build")),
+        ("Python", "Library/Caches/pip", "pip cache", "safe", ("pip", "pip install")),
+        ("Python", ".cache/pip", "pip cache", "safe", ("pip", "pip install")),
+        ("Python", "Library/Caches/uv", "uv cache", "safe", ("uv", "uv sync")),
+        ("Python", ".cache/uv", "uv cache", "safe", ("uv", "uv sync")),
+        ("Python", "Library/Caches/pypoetry", "Poetry cache", "safe", ("Poetry", "poetry install")),
+        ("Python", "Library/Caches/pre-commit", "pre-commit cache", "safe", ("pre-commit", "pre-commit install")),
+        ("Khác", "Library/Caches/CocoaPods", "CocoaPods cache", "safe", ("CocoaPods", "pod install")),
+        ("Khác", ".cocoapods/repos", "Kho CocoaPods (repos)", "review", ("CocoaPods", "pod repo update")),
+        ("Khác", ".rustup/toolchains", "Rust toolchains", "review", ("Rust", "rustup toolchain install")),
+        ("Khác", ".swiftpm", "Swift Package Manager", "safe", ("SwiftPM", "lần build sau")),
+    ):
+        tool, cmdname = ad
+        one(group, rel, lab, risk,
+            A(f"Kho gói {tool} tải về dùng chung cho mọi project trên máy.",
+              "Toàn bộ: tải lại khi bạn chạy " + cmdname + ".",
+              "Lần cài/build kế tiếp cần mạng và lâu hơn.",
+              "Nên làm khi đang có mạng tốt.",
+              "Khi thư mục vượt vài GB, hoặc vài tháng một lần."))
+    pv = _p(".pyenv/versions")
+    if os.path.isdir(pv):
+        kids = [os.path.join(pv, n) for n in listdir(pv)]
+        for k, sz in sorted(zip(kids, du_many(kids) if kids else []), key=lambda x: -x[1])[:8]:
+            row("Python", f"Python {os.path.basename(k)} (pyenv)", sz, k, risk="careful", note=home_short(k),
+                advice=A(f"Bản Python {os.path.basename(k)} cài bằng pyenv, kèm các gói đã cài trong đó.",
+                         "Bản nào không project nào dùng (xem file .python-version trong project).",
+                         "Môi trường ảo tạo từ bản này sẽ hỏng.",
+                         "Xóa đúng cách: pyenv uninstall " + os.path.basename(k),
+                         "Khi bạn đã chuyển hết project sang bản Python mới hơn."))
+
+    # ----- môi trường ảo & node_modules bỏ quên
+    step("Đang tìm môi trường ảo và node_modules lâu không dùng…")
+    old_envs = [i for i in STATE["items"] if i["cat"] == "envs" and i.get("mtime")
+                and time.time() - i["mtime"] > 120 * 86400]
+    if old_envs:
+        tot = sum(i["size"] or 0 for i in old_envs)
+        row("Bỏ quên", f"{len(old_envs)} thư mục node_modules / môi trường ảo quá 4 tháng không đụng tới",
+            tot, old_envs[0]["path"], risk="review", extra=[i["path"] for i in old_envs[1:]],
+            note="Xem chi tiết từng thư mục ở tab Đề xuất → " + next((t for c, t, _ in CATEGORIES if c == "envs"), "envs"),
+            advice=A("Các thư mục cài gói của project (node_modules, venv, .venv, vendor) đã lâu không được sửa.",
+                     "Toàn bộ: cài lại bằng npm install / pip install -r requirements.txt khi cần dùng lại project.",
+                     "Project nào cần chạy ngay sẽ phải cài lại (vài phút).",
+                     "Mở tab Đề xuất để xem từng project nếu muốn chọn lọc.",
+                     "Khi project đã lâu không đụng tới. Đây thường là nhóm giải phóng nhiều nhất trên máy lập trình."))
+    with LOCK:
+        TOOL_ITEMS.update({i["id"]: i for i in items})
+    TOOLS["dev2"]["total"] = sum(i["size"] or 0 for i in items)
+    order = {"Gradle": 0, "Android SDK": 1, "Máy ảo Android": 2, "Docker / OrbStack": 3, "Node.js": 4,
+             "Python": 5, "Khác": 6, "Bỏ quên": 7}
+    items.sort(key=lambda i: (order.get(i.get("group"), 9), -(i["size"] or 0)))
+    return {"rows": items, "total": sum(i["size"] or 0 for i in items)}
+
+
+# ---- nhiệt độ & giảm xung
+def parse_therm(text):
+    out = {}
+    for m in re.finditer(r"(\w+)\s*=\s*(\d+)", text or ""):
+        out[m.group(1)] = int(m.group(2))
+    return out
+
+
+def thermal(groups=None, therm_text=None, batt=None):
+    t = parse_therm(therm_text if therm_text is not None else sh(["pmset", "-g", "therm"]))
+    speed = t.get("CPU_Speed_Limit")
+    sched = t.get("CPU_Scheduler_Limit")
+    avail = t.get("CPU_Available_CPUs")
+    ncpu = os.cpu_count() or 1
+    b = batt if batt is not None else battery_info(light=True)
+    groups = groups if groups is not None else proc_snapshot()
+    temp = (b or {}).get("temp")
+    kt = next((g["cpu"] for g in groups if g["label"] == "kernel_task"), 0)
+    thr = []
+    if speed is not None and speed < 100:
+        thr.append(f"macOS đang hạ xung CPU còn {speed}% để giảm nhiệt")
+    if sched is not None and sched < 100:
+        thr.append(f"chỉ cho phép dùng {sched}% lịch CPU")
+    if avail is not None and avail < ncpu:
+        thr.append(f"tạm khóa bớt nhân CPU ({avail}/{ncpu} nhân đang dùng được)")
+    if kt >= 100:
+        thr.append(f"kernel_task đang chiếm {kt:.0f}% CPU — cách macOS tự chiếm chỗ để ép máy chạy chậm lại cho nguội")
+    hot = [g for g in groups if g["cpu"] >= 40][:5]
+    if temp is None and not t and not thr:
+        state, lv = "unknown", "info"
+    elif thr:
+        state, lv = "throttle", "bad"
+    elif (temp or 0) >= 37 or kt >= 50:
+        state, lv = "hot", "warn"
+    else:
+        state, lv = "ok", "ok"
+    msg = {"throttle": "Máy đang nóng và bị hạ hiệu năng: " + "; ".join(thr) + ".",
+           "hot": f"Máy đang ấm{f' (pin {temp:.0f}°C)' if temp else ''} nhưng chưa bị hạ hiệu năng.",
+           "ok": f"Nhiệt độ bình thường{f' (pin {temp:.0f}°C)' if temp else ''}, không bị hạ hiệu năng.",
+           "unknown": "Không đọc được thông tin nhiệt trên máy này."}[state]
+    tips = []
+    if hot:
+        tips.append("Đang đốt CPU nhiều nhất: " + ", ".join(f"{g['label']} {g['cpu']:.0f}%" for g in hot)
+                    + ". Đóng hoặc buộc dừng ở tab Hoạt động sẽ hạ nhiệt nhanh nhất.")
+    if state in ("throttle", "hot"):
+        tips += ["Kê máy lên mặt phẳng cứng, thoáng (đừng đặt trên chăn, gối, đùi): MacBook thoát nhiệt qua vỏ.",
+                 "Rút sạc một lát nếu pin đang nóng, hoặc bật Chế độ nguồn điện thấp.",
+                 "Phòng nóng, nắng chiếu trực tiếp hoặc ốp lưng dày đều làm máy nóng hơn thấy rõ."]
+    if kt >= 100:
+        tips.append("kernel_task cao gần như luôn là chuyện nhiệt chứ không phải lỗi: đừng buộc dừng nó (cũng không dừng được).")
+    return {"state": state, "lv": lv, "msg": msg, "temp": temp, "speed": speed, "sched": sched,
+            "avail": avail, "ncpu": ncpu, "kernel_task": kt, "raw": t,
+            "hot": [{"key": g["key"], "label": g["label"], "cpu": g["cpu"]} for g in hot], "tips": tips,
+            "note": "macOS không cho đọc nhiệt độ CPU nếu không có quyền quản trị, nên Spotless Mac dùng nhiệt độ pin "
+                    "và tín hiệu hạ xung của hệ thống — đủ để biết máy có đang nóng và bị chậm lại hay không."}
+
+
+# ---- mạng theo app
+def parse_nettop(text):
+    """nettop -P -x -L 2: hai mẫu liên tiếp, giá trị cộng dồn từ lúc tiến trình chạy."""
+    samples, cur = [], None
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if ln.lower().startswith("time,"):
+            if cur:
+                samples.append(cur)
+            cur = {}
+            continue
+        if cur is None:
+            cur = {}
+        f = ln.split(",")
+        if len(f) < 4:
+            continue
+        name = f[1].strip()
+        if "." not in name:
+            continue
+        pid = name.rsplit(".", 1)[-1]
+        if not pid.isdigit():
+            continue
+        try:
+            cur[int(pid)] = (int(float(f[2] or 0)), int(float(f[3] or 0)))
+        except ValueError:
+            continue
+    if cur:
+        samples.append(cur)
+    return samples
+
+
+def net_apps(groups=None, text=None, secs=1.0):
+    if text is None:
+        try:
+            r = subprocess.run(["nettop", "-P", "-x", "-L", "2", "-J", "bytes_in,bytes_out"],
+                               capture_output=True, text=True, timeout=25, env=dict(os.environ, LC_ALL="C"))
+            text = r.stdout
+        except Exception:
+            text = ""
+    sm = parse_nettop(text)
+    if not sm:
+        return {"apps": [], "error": "Không đọc được số liệu mạng (lệnh nettop của macOS không chạy được ở đây)."}
+    first, last = sm[0], sm[-1]
+    groups = groups if groups is not None else proc_snapshot()
+    out = []
+    for g in groups:
+        tin = tout = din = dout = 0
+        for p in g["procs"]:
+            a, b = last.get(p["pid"], (0, 0))
+            c, dd = first.get(p["pid"], (0, 0))
+            tin += a
+            tout += b
+            din += max(0, a - c)
+            dout += max(0, b - dd)
+        if tin + tout < 64 * 1024:
+            continue
+        out.append({"key": g["key"], "label": g["label"], "system": g["system"], "browser": g["browser"],
+                    "in": tin, "out": tout, "in_s": din / secs, "out_s": dout / secs,
+                    "tip": net_tip(g, tin, tout)})
+    out.sort(key=lambda x: -(x["in_s"] + x["out_s"] + (x["in"] + x["out"]) / 1e6))
+    return {"apps": out[:20], "error": "", "secs": secs}
+
+
+def net_tip(g, tin, tout):
+    n = (g["label"] + " " + (g.get("bid") or "")).lower()
+    if g["browser"]:
+        return ("Tab video, phim và mạng xã hội tải nền liên tục. Đóng tab không xem (tab Hoạt động → Xem tab) "
+                "là cách giảm nhanh nhất.")
+    for k, t in (("orbstack", "Container đang tải image hoặc gói. Dừng container không dùng bằng docker stop."),
+                 ("docker", "Container đang tải image hoặc gói."),
+                 ("backupd", "Time Machine đang sao lưu qua mạng."),
+                 ("bird", "iCloud Drive đang đồng bộ."), ("cloudd", "Các app đang đồng bộ iCloud."),
+                 ("fileprovider", "Ổ đám mây (iCloud, Google Drive, OneDrive, Dropbox) đang đồng bộ."),
+                 ("softwareupdate", "macOS đang tải bản cập nhật."),
+                 ("dropbox", "Dropbox đang đồng bộ."), ("drive", "Google Drive đang đồng bộ."),
+                 ("onedrive", "OneDrive đang đồng bộ."), ("spotify", "Spotify đang tải nhạc."),
+                 ("steam", "Steam đang tải game."), ("cloudflare", "Mọi lưu lượng mạng đi qua WARP nên nó luôn đứng đầu danh sách."),
+                 ("claude", "Đang tải/gửi dữ liệu hội thoại hoặc tự cập nhật."),
+                 ("android studio", "Gradle đang tải thư viện."), ("code", "Tiện ích hoặc bản cập nhật đang tải.")):
+        if k in n:
+            return t
+    if tout > tin * 3 and tout > 50 * 1024 * 1024:
+        return "App này tải LÊN nhiều hơn tải xuống: thường là đang sao lưu hoặc đồng bộ dữ liệu lên mây."
+    return "Nếu bạn không chủ động tải gì, hãy xem app này có đang tự cập nhật hoặc đồng bộ nền không."
+
+
+# ---- quyền riêng tư (TCC)
+TCC_SERVICES = [
+    ("kTCCServiceCamera", "Camera", "Privacy_Camera", "App có thể bật camera bất cứ lúc nào khi đang chạy."),
+    ("kTCCServiceMicrophone", "Micro", "Privacy_Microphone", "App có thể thu âm khi đang chạy."),
+    ("kTCCServiceScreenCapture", "Ghi màn hình", "Privacy_ScreenCapture",
+     "App có thể nhìn và ghi lại toàn bộ màn hình, gồm cả nội dung cửa sổ app khác."),
+    ("kTCCServiceAccessibility", "Trợ năng (điều khiển máy)", "Privacy_Accessibility",
+     "Quyền mạnh nhất: app có thể bấm chuột, gõ phím và đọc nội dung mọi cửa sổ thay bạn."),
+    ("kTCCServiceListenEvent", "Theo dõi bàn phím", "Privacy_ListenEvent",
+     "App đọc được mọi phím bạn gõ, kể cả ngoài app đó."),
+    ("kTCCServiceSystemPolicyAllFiles", "Toàn quyền truy cập ổ đĩa", "Privacy_AllFiles",
+     "App đọc được mọi file, gồm cả Mail, Tin nhắn và dữ liệu của app khác."),
+    ("kTCCServiceAppleEvents", "Điều khiển app khác", "Privacy_Automation",
+     "App ra lệnh được cho app khác (gửi thư, mở tab, xóa file…)."),
+    ("kTCCServiceSystemPolicyDesktopFolder", "Thư mục Màn hình nền", "Privacy_SystemPolicyDesktopFolder", ""),
+    ("kTCCServiceSystemPolicyDocumentsFolder", "Thư mục Tài liệu", "Privacy_SystemPolicyDocumentsFolder", ""),
+    ("kTCCServiceSystemPolicyDownloadsFolder", "Thư mục Tải về", "Privacy_SystemPolicyDownloadsFolder", ""),
+    ("kTCCServicePhotos", "Ảnh", "Privacy_Photos", ""),
+    ("kTCCServiceAddressBook", "Danh bạ", "Privacy_Contacts", ""),
+    ("kTCCServiceCalendar", "Lịch", "Privacy_Calendars", ""),
+    ("kTCCServiceReminders", "Lời nhắc", "Privacy_Reminders", ""),
+    ("kTCCServiceLocation", "Vị trí", "Privacy_LocationServices", ""),
+]
+RISKY_SERVICES = {"kTCCServiceCamera", "kTCCServiceMicrophone", "kTCCServiceScreenCapture",
+                  "kTCCServiceAccessibility", "kTCCServiceListenEvent", "kTCCServiceSystemPolicyAllFiles"}
+_APPMAP = {}
+
+
+def app_map():
+    if not _APPMAP:
+        bases = APP_DIRS + ["/System/Applications", "/Applications/Utilities", "/System/Library/CoreServices"]
+        for base in list(bases):
+            for n in listdir(base):
+                p = os.path.join(base, n)
+                if os.path.isdir(p) and not n.endswith(".app"):
+                    bases.append(p)
+        for base in bases:
+            for n in listdir(base):
+                if n.endswith(".app"):
+                    p = os.path.join(base, n)
+                    info = app_info(p)
+                    bid = (info.get("CFBundleIdentifier") or "").lower()
+                    if bid:
+                        _APPMAP.setdefault(bid, (n[:-4], p))
+    return _APPMAP
+
+
+def read_tcc(path):
+    """Đọc TCC.db ở chế độ chỉ đọc. Trả về (danh sách, lỗi)."""
+    if not os.path.exists(path):
+        return [], ""
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{path}?immutable=1", uri=True, timeout=3)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(access)")}
+        auth = "auth_value" if "auth_value" in cols else ("allowed" if "allowed" in cols else None)
+        if not auth:
+            return [], ""
+        extra = ", last_modified" if "last_modified" in cols else ""
+        rows = con.execute(f"SELECT service, client, client_type, {auth}{extra} FROM access").fetchall()
+        con.close()
+    except Exception as e:
+        return [], str(e)
+    out = []
+    for r in rows:
+        out.append({"service": r[0], "client": r[1], "type": r[2], "auth": r[3],
+                    "t": r[4] if len(r) > 4 else None})
+    return out, ""
+
+
+def privacy():
+    user_db = os.path.join(LIB, "Application Support/com.apple.TCC/TCC.db")
+    sys_db = "/Library/Application Support/com.apple.TCC/TCC.db"
+    rows, err = read_tcc(user_db)
+    srows, serr = read_tcc(sys_db)
+    rows += srows
+    if (err or serr) and not rows:
+        return {"error": "Chưa đọc được danh sách quyền: cần cấp “Toàn quyền truy cập ổ đĩa” cho Spotless Mac.",
+                "need_fda": True, "groups": [], "detail": (err or serr)[:200]}
+    amap = app_map()
+    by = {}
+    for r in rows:
+        allowed = r["auth"] in (2,) or (r["auth"] == 1 and r["service"] == "kTCCServiceAppleEvents")
+        if not allowed:
+            continue
+        cid = (r["client"] or "").lower()
+        name, path = amap.get(cid, (None, None))
+        if not name:
+            name = r["client"].split(".")[-1] if r["type"] == 0 else os.path.basename(r["client"] or "")
+        by.setdefault(r["service"], []).append({"id": r["client"], "name": name, "path": path,
+                                                "missing": r["type"] == 0 and cid not in amap and "/" not in (r["client"] or ""),
+                                                "t": r["t"]})
+    groups = []
+    for svc, title, pane, why in TCC_SERVICES:
+        apps = sorted(by.get(svc, []), key=lambda a: a["name"].lower())
+        if not apps:
+            continue
+        groups.append({"service": svc, "title": title, "why": why, "risky": svc in RISKY_SERVICES,
+                       "url": f"x-apple.systempreferences:com.apple.preference.security?{pane}", "apps": apps,
+                       "missing": sum(1 for a in apps if a["missing"])})
+    groups.sort(key=lambda g: (not g["risky"], g["title"]))
+    other = sorted({r["service"] for r in rows} - {s for s, *_ in TCC_SERVICES})
+    using = []
+    for g in proc_snapshot():
+        nm = g["label"].lower()
+        if nm == "replayd" and g["cpu"] >= 0.5:
+            using.append("Có app đang ghi hoặc chia sẻ màn hình (tiến trình replayd đang chạy).")
+    return {"error": "", "need_fda": False, "groups": groups, "other": other, "using": using,
+            "note": "Spotless Mac chỉ ĐỌC danh sách quyền; việc tắt quyền phải do bạn làm trong Cài đặt hệ thống "
+                    "(macOS không cho app nào tự sửa quyền của app khác)."}
+
+
+TOOLS["dev2"] = {"running": False, "step": "", "done": False, "data": None, "error": None, "at": None}
+TOOL_FUNCS["dev2"] = scan_dev_deep
+
+
 # ------------------------------------------------------------------ web
 class Handler(BaseHTTPRequestHandler):
     server_version = "DonMac/" + VERSION
@@ -4703,7 +5288,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._json({"error": "forbidden"}, 403)
             self._json({"machine": machine_info(), "security": security_info(), "startup": startup_items()})
-        elif self.path in ("/api/power", "/api/checks", "/api/startup", "/api/watch") or self.path.startswith("/api/trends"):
+        elif self.path in ("/api/power", "/api/checks", "/api/startup", "/api/watch", "/api/thermal", "/api/net",
+                           "/api/privacy", "/api/undo") or self.path.startswith("/api/trends"):
             if not self._authed():
                 return self._json({"error": "forbidden"}, 403)
             if self.path == "/api/power":
@@ -4714,6 +5300,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(startup_manage())
             if self.path == "/api/watch":
                 return self._json(watch_get())
+            if self.path == "/api/thermal":
+                return self._json(thermal())
+            if self.path == "/api/net":
+                return self._json(net_apps())
+            if self.path == "/api/privacy":
+                return self._json(privacy())
+            if self.path == "/api/undo":
+                return self._json({"batches": undo_list()})
             try:
                 days = int(self._query().get("days", "7"))
             except ValueError:
@@ -4828,6 +5422,8 @@ class Handler(BaseHTTPRequestHandler):
                                   body.get("idx"), str(body.get("url", "")), str(body.get("action", ""))))
         elif path == "/api/tabs_close":
             self._json(tabs_close_many(str(body.get("bid", "")), list(body.get("tabs", []))))
+        elif path == "/api/undo_do":
+            self._json(undo_batch(str(body.get("batch", ""))))
         elif path == "/api/watch_set":
             self._json(watch_set(**{k: v for k, v in body.items() if k in ("enabled", "stuck", "auto_kill", "battery", "pressure",
                                                                          "metrics", "cpu", "minutes")}))
@@ -5121,6 +5717,7 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
       <button data-tool="orphans">Dữ liệu mồ côi</button>
       <button data-tool="similar">Ảnh giống</button>
       <button data-tool="ai">Dấu vết AI</button>
+      <button data-tool="dev2">Dọn sâu (lập trình)</button>
     </div>
     <div id="tool-body"></div>
   </div>
@@ -5140,6 +5737,10 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
       <button data-osub="checks">✅ Kiểm tra nhanh</button>
       <button data-osub="startup">🚀 Khởi động cùng máy</button>
       <button data-osub="watch">👀 Theo dõi nền &amp; thanh menu</button>
+      <button data-osub="thermal">🌡 Nhiệt độ</button>
+      <button data-osub="net">🌐 Mạng</button>
+      <button data-osub="priv">🔒 Quyền riêng tư</button>
+      <button data-osub="undo">↩︎ Hoàn tác</button>
       <button data-osub="trends">📈 Lịch sử</button>
     </div>
     <div id="o-body"></div>
@@ -5496,8 +6097,9 @@ const TINFO={
   dupes:["File trùng lặp","So sánh nội dung (không chỉ tên) các file từ 1 MB trong thư mục của bạn. Mỗi nhóm giữ lại 1 bản, các bản còn lại được tích sẵn. Quét có thể mất vài phút."],
   orphans:["Dữ liệu mồ côi","Thư mục trong Library mang mã kiểu com.hang.app nhưng không có ứng dụng tương ứng trong Ứng dụng. Mức “Xem lại”: bấm nhãn để đọc giải thích trước khi xóa."],
   ai:["Dấu vết của Claude, Codex, ChatGPT","Các công cụ AI để lại rất nhiều file thừa: phiên bản cũ sau mỗi lần tự cập nhật, transcript và nhật ký của từng phiên, ảnh/file đính kèm, máy ảo Cowork, cache của app. Mỗi mục có nhãn rủi ro và giải thích. Transcript/log cũ bị xóa vĩnh viễn (chỉ file cũ hơn số ngày ghi trên mục)."],
+  dev2:["Dọn sâu cho công cụ lập trình","Đi sâu vào Gradle, Android SDK, máy ảo Android, Docker/OrbStack, Node.js và Python: tách từng phần bên trong để biết chính xác GB nằm ở đâu, bản nào cũ có thể bỏ. Mỗi mục đều nói rõ xóa rồi mất gì và cài lại bằng lệnh nào."],
   similar:["Ảnh giống nhau","Tìm ảnh trông giống nhau (cùng ảnh nhưng khác kích cỡ, chỉnh nhẹ…). Chỉ để bạn xem và tự chọn, không tích sẵn gì cả."]};
-const TL={};for(const k of ["apps","dupes","orphans","similar","ai"])TL[k]={data:null,sel:new Set(),started:false,running:false,step:"",error:null,at:null,open:new Set()};
+const TL={};for(const k of ["apps","dupes","orphans","similar","ai","dev2"])TL[k]={data:null,sel:new Set(),started:false,running:false,step:"",error:null,at:null,open:new Set()};
 let tool="apps", tmode="trash";
 const flat=n=>{const d=TL[n].data;if(!d)return[];return d.rows?d.rows:(d.groups||[]).flatMap(g=>g.files)};
 function setTool(n){
@@ -5531,7 +6133,7 @@ function renderTool(){
   if(t.running){b.innerHTML=h+`<div class="progress"><span class="spin"></span>${esc(t.step)}</div>`;return}
   if(t.error)h+=`<div class="warn">Lỗi khi quét: ${esc(t.error)}</div>`;
   if(!t.data){b.innerHTML=h+`<div class="tools"><button class="small" data-tstart="${n}" style="margin-left:0">Bắt đầu quét</button></div>`;return}
-  h+=(n==="apps"||n==="orphans"||n==="ai")?rowsHTML(n,t.data):groupsHTML(n,t.data);
+  h+=(n==="apps"||n==="orphans"||n==="ai"||n==="dev2")?rowsHTML(n,t.data):groupsHTML(n,t.data);
   b.innerHTML=h;
 }
 function rowHTML(n,r){
@@ -5551,8 +6153,9 @@ function rowsHTML(n,d){
   const t=TL[n],rows=d.rows;
   let h="";
   if(n==="orphans"&&d.limited)h+=`<div class="warn">Chưa có “Toàn quyền truy cập ổ đĩa” nên chưa thấy hết dữ liệu (Containers, Group Containers…). <button class="small" data-act="open_fda">Mở cài đặt quyền</button></div>`;
-  if(!rows.length)return h+`<div class="empty">${n==="apps"?"Không có ứng dụng nào để gỡ.":n==="ai"?"Không thấy dấu vết đáng kể nào của Claude, Codex, ChatGPT 🎉":"Không thấy dữ liệu mồ côi nào 🎉"}</div>`;
-  const pick=n==="apps"?`<button data-tpick="${n}">Chọn app lâu không mở</button>`:n==="ai"?`<button data-tpick="ai">Chọn mục “An toàn”</button>`:"";
+  if(!rows.length)return h+`<div class="empty">${n==="apps"?"Không có ứng dụng nào để gỡ.":n==="ai"?"Không thấy dấu vết đáng kể nào của Claude, Codex, ChatGPT 🎉":n==="dev2"?"Không thấy cache lập trình nào đáng kể 🎉":"Không thấy dữ liệu mồ côi nào 🎉"}</div>`;
+  const pick=(n==="apps")?`<button data-tpick="${n}">Chọn app lâu không mở</button>`:(n==="ai"||n==="dev2")?`<button data-tpick="${n}">Chọn mục “An toàn”</button>`:"";
+  if(n==="dev2")h+=`<p class="mut" style="margin:0 0 10px">Tổng ${human(d.total||0)} trong ${rows.length} mục. Các mục “An toàn” đều tự tải/tạo lại được.</p>`;
   h+=toolBar(n,pick);
   const grouped=rows.some(r=>r.group);
   const sets=grouped?[...new Set(rows.map(r=>r.group||"Khác"))].map(g=>[g,rows.filter(r=>(r.group||"Khác")===g)]):[[null,rows]];
@@ -5799,14 +6402,17 @@ function setOsub(n){
   if(OP.timer){clearInterval(OP.timer);OP.timer=null}
   const load={power:()=>api("/api/power").then(r=>{OP.power=r}),checks:()=>api("/api/checks").then(r=>{OP.checks=r}),
     startup:()=>api("/api/startup").then(r=>{OP.startup=r}),watch:()=>api("/api/watch").then(r=>{OP.watch=r}),
+    thermal:()=>api("/api/thermal").then(r=>{OP.thermal=r}),net:()=>api("/api/net").then(r=>{OP.net=r}),
+    priv:()=>api("/api/privacy").then(r=>{OP.priv=r}),undo:()=>api("/api/undo").then(r=>{OP.undo=r}),
     trends:()=>api("/api/trends?days="+OP.days).then(r=>{OP.trends=r})}[n];
   renderOsub();
   load().then(renderOsub).catch(()=>{});
-  if(n==="power")OP.timer=setInterval(()=>{if(tab!=="optim"||OP.sub!=="power"||dead){clearInterval(OP.timer);OP.timer=null;return}
-    if(Date.now()-AC.downAt<800)return;load().then(()=>{if(OP.sub==="power")renderOsub()}).catch(()=>{})},6000);
+  if(n==="power"||n==="thermal"||n==="net")OP.timer=setInterval(()=>{if(tab!=="optim"||OP.sub!=="power"||dead){clearInterval(OP.timer);OP.timer=null;return}
+    if(Date.now()-AC.downAt<800)return;load().then(()=>{if(OP.sub===n)renderOsub()}).catch(()=>{})},6000);
 }
 function renderOsub(){
-  const f={power:renderPower,checks:renderChecks,startup:renderStartup,watch:renderWatch,trends:renderTrends}[OP.sub];
+  const f={power:renderPower,checks:renderChecks,startup:renderStartup,watch:renderWatch,trends:renderTrends,
+    thermal:renderThermal,net:renderNet,priv:renderPriv,undo:renderUndo}[OP.sub];
   $("o-body").innerHTML=f();
 }
 function renderPower(){
@@ -5930,6 +6536,12 @@ document.addEventListener("click",async e=>{
   const os=e.target.closest("[data-osub]");if(os){setOsub(os.dataset.osub);return}
   const ga=e.target.closest("[data-goact]");if(ga){AC.open.add(ga.dataset.goact);setTab("activity");return}
   const ou=e.target.closest("[data-ourl]");if(ou){api("/api/open_url",{url:ou.dataset.ourl});return}
+  const ud=e.target.closest("[data-oundo]");
+  if(ud){if(!confirm("Đưa các mục của lần dọn này từ Thùng rác về chỗ cũ?\n\nMục nào đã bị dọn khỏi Thùng rác, hoặc chỗ cũ đã có tệp khác, sẽ được bỏ qua."))return;
+    const r=await api("/api/undo_do",{batch:ud.dataset.oundo});
+    toast(r.ok?`✅ Đã khôi phục ${r.done} mục (${esc(human(r.size))})`+(r.skipped.length?`, bỏ qua ${r.skipped.length}`:""):`⚠️ ${esc(r.error||"Không hoàn tác được")}`);
+    if(r.skipped&&r.skipped.length)alert("Bỏ qua:\n\n"+r.skipped.join("\n"));
+    OP.undo=null;setOsub("undo");refresh();return}
   const od=e.target.closest("[data-odays]");if(od){OP.days=+od.dataset.odays;OP.trends=null;setOsub("trends");return}
   const om=e.target.closest("[data-omove]");
   if(om){if(!confirm(`Chuyển app này vào thư mục Ứng dụng?\n\n${om.dataset.omove}\n\nHãy thoát app trước (⌘Q).`))return;
@@ -5951,6 +6563,65 @@ document.addEventListener("click",async e=>{
     renderOsub();return}
 });
 document.addEventListener("input",e=>{if(e.target.matches("[data-wn]"))e.stopPropagation()});
+
+/* ---- 006: nhiệt độ, mạng, quyền riêng tư, hoàn tác */
+function renderThermal(){
+  const t=OP.thermal;if(!t)return spinCard("Đang đọc tình trạng nhiệt…");
+  const C={ok:["d-safe","Mát"],warn:["d-review","Hơi nóng"],bad:["d-careful","Nóng, đang bị chậm lại"],info:["d-review","Không đọc được"]}[t.lv];
+  return `<div class="card"><h2 class="apress"><span class="dot ${C[0]}"></span>${C[1]}</h2>
+    <div class="verd">${esc(t.msg)}</div>
+    <div class="pflow" style="grid-template-columns:repeat(3,1fr)">
+      <div class="bx"><span class="mut">Nhiệt độ pin</span><b>${t.temp!=null?num(t.temp,0)+"°C":"—"}</b><span class="mut">${t.temp!=null?(t.temp>=37?"nóng":t.temp>=33?"ấm":"bình thường"):"không đọc được"}</span></div>
+      <div class="bx"><span class="mut">Tốc độ CPU</span><b style="color:var(--${t.speed!=null&&t.speed<100?"careful":"text"})">${t.speed!=null?t.speed+"%":"—"}</b><span class="mut">${t.speed!=null&&t.speed<100?"đang bị hạ xung":"không bị hạ"}</span></div>
+      <div class="bx"><span class="mut">Nhân CPU dùng được</span><b>${t.avail!=null?t.avail+"/"+t.ncpu:t.ncpu}</b><span class="mut">${t.kernel_task>=50?"kernel_task "+num(t.kernel_task,0)+"%":"bình thường"}</span></div></div>
+    ${t.tips.map(x=>`<div class="aflag ${t.lv==="bad"?"bad":"warn"}">💡 ${esc(x)}</div>`).join("")}
+    <p class="k" style="margin-top:8px">${esc(t.note)}</p></div>
+  ${t.hot.length?`<div class="card"><h2>Đang làm máy nóng</h2><table class="mini"><tr><th>App</th><th class="r">CPU</th><th></th></tr>
+    ${t.hot.map(h=>`<tr><td><b>${esc(h.label)}</b></td><td class="num">${num(h.cpu)}%</td><td class="r"><button class="link" data-goact="${esc(h.key)}">Chi tiết</button></td></tr>`).join("")}</table></div>`:""}`;
+}
+function renderNet(){
+  const n=OP.net;if(!n)return spinCard("Đang đo lưu lượng mạng (vài giây)…");
+  if(n.error)return `<div class="card"><h2>Mạng theo app</h2><p class="k">${esc(n.error)}</p></div>`;
+  const mx=Math.max(1,...n.apps.map(a=>a.in_s+a.out_s));
+  const sp=v=>human(v)+"/giây";
+  return `<div class="card"><h2>App dùng mạng nhiều nhất</h2>
+    <p class="k">“Đang tải” là tốc độ đo trong 1 giây vừa rồi; “Tổng” là lượng dữ liệu app đã truyền từ lúc nó được mở. Tự cập nhật mỗi 6 giây. Dữ liệu lấy từ lệnh nettop của macOS, chỉ tính các tiến trình của bạn.</p>
+    ${n.apps.length?`<table class="mini"><tr><th>App</th><th class="r">Đang tải xuống</th><th class="r">Đang tải lên</th><th style="width:16%"></th><th class="r">Tổng xuống</th><th class="r">Tổng lên</th><th>Vì sao</th></tr>
+    ${n.apps.map(a=>`<tr><td><b>${esc(a.label)}</b>${a.system?` <span class="badge b-mute">hệ thống</span>`:""}</td>
+      <td class="num">${a.in_s>=1024?sp(a.in_s):"—"}</td><td class="num">${a.out_s>=1024?sp(a.out_s):"—"}</td>
+      <td><div class="bar" style="margin:0"><div style="width:${((a.in_s+a.out_s)/mx*100).toFixed(0)}%"></div></div></td>
+      <td class="num">${human(a.in)}</td><td class="num">${human(a.out)}</td><td class="vt" style="max-width:300px">${esc(a.tip)}</td></tr>`).join("")}</table>`
+    :`<p class="mut">Không app nào đang dùng mạng đáng kể.</p>`}</div>`;
+}
+function renderPriv(){
+  const p=OP.priv;if(!p)return spinCard("Đang đọc danh sách quyền…");
+  if(p.error)return `<div class="card"><h2>Quyền riêng tư</h2><p class="k">${esc(p.error)}</p>
+    <button class="small" style="margin-left:0" data-act="open_fda">Mở cài đặt quyền</button>
+    <p class="mut" style="margin-top:8px">Spotless Mac chỉ đọc file danh sách quyền của macOS để liệt kê; không sửa được quyền của app nào.</p></div>`;
+  const miss=p.groups.reduce((a,g)=>a+g.missing,0);
+  return `<div class="card"><h2>Quyền riêng tư</h2><p class="k">${esc(p.note)}</p>
+    ${miss?`<div class="aflag warn">⚠️ Có ${miss} mục là app đã gỡ nhưng quyền vẫn còn. Nên bỏ khỏi danh sách cho gọn.</div>`:""}
+    ${(p.using||[]).map(u=>`<div class="aflag warn">👁 ${esc(u)}</div>`).join("")}</div>
+  ${p.groups.map(g=>`<div class="card"><h2>${esc(g.title)} ${g.risky?`<span class="badge b-careful">quyền mạnh</span>`:""} <span class="mut" style="font-weight:400;font-size:13px">${g.apps.length} app</span></h2>
+    ${g.why?`<p class="k">${esc(g.why)}</p>`:""}
+    <table class="mini">${g.apps.map(a=>`<tr><td><b>${esc(a.name)}</b>${a.missing?` <span class="badge b-review">app đã gỡ</span>`:""}<div class="mut">${esc(a.id)}</div></td>
+      <td class="r mut">${a.t?esc(when(a.t)):""}</td></tr>`).join("")}</table>
+    <button class="small" style="margin-left:0;margin-top:8px" data-ourl="${esc(g.url)}">Mở cài đặt ${esc(g.title)}</button></div>`).join("")}`;
+}
+function renderUndo(){
+  const u=OP.undo;if(!u)return spinCard("Đang đọc các lần dọn…");
+  const bs=u.batches;
+  return `<div class="card"><h2>Hoàn tác lần dọn</h2>
+    <p class="k">Những mục được chuyển vào Thùng rác có thể đưa về đúng chỗ cũ. Mục đã xóa vĩnh viễn, lệnh dọn (docker prune, brew cleanup) và Thùng rác đã dọn sạch thì không hoàn tác được.</p>
+    ${bs.length?`<table class="mini"><tr><th>Lần dọn</th><th>Gồm</th><th class="r">Dung lượng</th><th class="r">Khôi phục được</th><th></th></tr>
+    ${bs.map(b=>`<tr><td style="white-space:nowrap">${esc(when(b.t))}<div class="mut">${b.src==="auto"?"Tự động":b.src==="undo"?"Hoàn tác":"Thủ công"}</div></td>
+      <td>${b.n} mục<div class="mut">${esc(b.labels.join(", "))}${b.n>b.labels.length?"…":""}</div></td>
+      <td class="num">${human(b.size)}</td>
+      <td class="num">${b.undone?`<span class="badge b-safe">đã hoàn tác</span>`:b.can?`${b.can} mục · ${human(b.can_size)}`:`<span class="mut">—</span>`}
+        ${b.gone?`<div class="mut">${b.gone} đã rời Thùng rác</div>`:""}${b.blocked?`<div class="mut">${b.blocked} chỗ cũ đã có tệp khác</div>`:""}</td>
+      <td class="r">${b.can&&!b.undone?`<button class="small" style="margin-left:0" data-oundo="${esc(b.batch)}">Hoàn tác</button>`:""}</td></tr>`).join("")}</table>`
+    :`<span class="mut">Chưa có lần dọn nào ghi lại được đường dẫn (tính năng này có từ bản 6.1).</span>`}</div>`;
+}
 
 /* ================= 003: Máy & cài đặt ================= */
 const dur=s=>{if(s==null)return"—";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+" ngày ":"")+(h?h+" giờ ":"")+m+" phút"};
@@ -5975,7 +6646,7 @@ function renderSettings(s){
     ${s.kept.length?`<table class="mini">${s.kept.map(k=>`<tr><td>${esc(k.short)}</td><td class="r"><button class="link" data-unkeep="${esc(k.path)}">Bỏ giữ</button></td></tr>`).join("")}</table>`:`<span class="mut">Chưa có mục nào.</span>`}</div>`;
   const h=s.history,tot=h.filter(x=>x.mode!=="x").reduce((a,b)=>a+(b.size||0),0);
   $("m-hist").innerHTML=`<div class="card"><h2>Lịch sử dọn dẹp</h2>
-    ${h.length?`<p class="k">${h.length} mục gần nhất · tổng ${human(tot)}. <button class="link" id="histClear">Xóa lịch sử</button></p>
+    ${h.length?`<p class="k">${h.length} mục gần nhất · tổng ${human(tot)}. <button class="link" data-gosub="undo">Hoàn tác một lần dọn</button> · <button class="link" id="histClear">Xóa lịch sử</button></p>
     <table class="mini"><tr><th>Thời gian</th><th>Mục</th><th>Cách xóa</th><th>Nguồn</th><th class="r">Dung lượng</th></tr>
     ${h.slice(0,100).map(x=>`<tr><td>${esc(when(x.t))}</td><td>${esc(x.label)}<div class="mut">${esc(x.path||"")}</div></td><td>${x.mode==="permanent"?"Vĩnh viễn":"Thùng rác"}</td><td>${x.src==="auto"?"Tự động":"Thủ công"}</td><td class="r">${human(x.size)}</td></tr>`).join("")}</table>`
     :`<span class="mut">Chưa có lần dọn nào được ghi lại.</span>`}</div>`;
@@ -6012,7 +6683,7 @@ document.addEventListener("click",async e=>{
   const tp=e.target.closest("[data-tpick]");
   if(tp){const n=tp.dataset.tpick,t=TL[n==="similarAll"||n==="similarRest"?"similar":n];t.sel=new Set();
     if(n==="apps")for(const r of t.data.rows)if(r.risk==="safe")t.sel.add(r.id);
-    if(n==="ai")for(const r of t.data.rows)if(r.risk==="safe")t.sel.add(r.id);
+    if(n==="ai"||n==="dev2")for(const r of t.data.rows)if(r.risk==="safe")t.sel.add(r.id);
     if(n==="dupes")for(const g of t.data.groups)for(const f of g.files)if(f.id!==g.keep&&f.deletable)t.sel.add(f.id);
     if(n==="similarAll")for(const g of TL.similar.data.groups)for(const f of g.files)if(f.deletable)TL.similar.sel.add(f.id);
     if(n==="similarRest")for(const g of TL.similar.data.groups)g.files.forEach((f,i)=>{if(i>0&&f.deletable)TL.similar.sel.add(f.id)});

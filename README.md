@@ -32,6 +32,11 @@ Chạy thử không cần cài: `python3 src/don_mac.py`.
 | Nên xóa khi nào | Mọi lời khuyên có thêm mục “🕒 Nên xóa khi nào”; thư mục Electron/Chromium quen thuộc (CertificateRevocation, Crashpad, ShaderCache…) được giải thích cụ thể |
 | **Hoạt động** | Như Giám sát hoạt động nhưng có giải thích: app/tiến trình nào ngốn RAM, CPU nhiều nhất (gom helper về app chủ), Áp lực bộ nhớ, phát hiện tiến trình bị kẹt (ví dụ `crashpad_handler` ăn 100%+ CPU), vì sao tốn và nên đóng khi nào. Với Brave/Chrome/Edge/Arc/Safari: liệt kê tab, xếp hạng tab nặng nhất (ước tính hoặc đo chính xác), chuyển tới hoặc đóng tab ngay. Không bao giờ cho buộc dừng tiến trình hệ thống. |
 | **Pin & tối ưu** | Pin & sạc (củ sạc cấp bao nhiêu W so với máy đang dùng, cảnh báo pin tụt khi cắm sạc, app tốn điện nhất theo “Tác động năng lượng”, sức khỏe pin); Kiểm tra nhanh (Tiết kiệm bộ nhớ/tăng tốc phần cứng/chạy nền của Brave–Chrome–Edge, tiện ích nặng hoặc thừa, app chạy từ Tải về, Chế độ nguồn điện thấp, nên khởi động lại); Khởi động cùng máy (tắt/bật LaunchAgent có sao lưu, bỏ/thêm app mở khi đăng nhập); Theo dõi nền mỗi phút (báo tiến trình kẹt, tự buộc dừng crashpad, pin tụt, thiếu RAM) và biểu tượng trên thanh menu; Lịch sử ổ đĩa/RAM/pin, dự báo ngày đầy ổ, ổ đầy vì đâu, đã dọn theo tuần. |
+| **Công cụ → Dọn sâu (lập trình)** | Mổ xẻ Gradle (thư viện, build cache, transforms, bản Gradle cũ), Android SDK (system image, NDK, build-tools, platform cũ), snapshot máy ảo Android, image Docker/OrbStack không dùng, cache npm/pnpm/yarn/bun/pip/uv/Poetry/CocoaPods/Rust, bản Python pyenv, và gom node_modules/venv quá 4 tháng không đụng tới. |
+| **Pin & tối ưu → Nhiệt độ** | Máy có đang bị macOS hạ xung CPU vì nóng không (tốc độ CPU %, số nhân bị khóa, kernel_task), nhiệt độ pin, app đang đốt CPU và cách hạ nhiệt. |
+| **Pin & tối ưu → Mạng** | App nào đang tải lên/xuống nhiều nhất (tốc độ theo giây và tổng từ lúc mở), kèm lý do thường gặp: đồng bộ iCloud/Drive, container đang pull, tab video. |
+| **Pin & tối ưu → Quyền riêng tư** | Liệt kê app đang có quyền Camera, Micro, Ghi màn hình, Trợ năng, Theo dõi bàn phím, Toàn quyền ổ đĩa…; đánh dấu app đã gỡ nhưng còn quyền; mở thẳng trang cài đặt tương ứng (chỉ đọc, không tự sửa quyền). |
+| **Pin & tối ưu → Hoàn tác** | Gom theo từng lần dọn; một nút đưa mọi file của lần đó từ Thùng rác về đúng chỗ cũ, bỏ qua mục đã rời Thùng rác hoặc chỗ cũ đã có tệp khác. |
 | **Máy & cài đặt** | Dọn tự động theo lịch, danh sách **Luôn giữ**, lịch sử dọn dẹp, trạng thái máy, mục tự khởi động, bảo mật cơ bản (chỉ xem). |
 
 ### Dòng lệnh
@@ -62,6 +67,8 @@ python3 tests/test_activity.py
 FAKE_HOME=/tmp/fha node tests/ui_activity.js
 HOME=/tmp/fho python3 tests/test_optim.py
 FAKE_HOME=/tmp/fhp node tests/ui_optim.js
+HOME=/tmp/fhd python3 tests/test_deep.py
+FAKE_HOME=/tmp/fhq node tests/ui_deep.js
 HOME=/tmp/fh python3 tests/test_tools.py
 node tests/ui_smoke.js                                   # đặt FAKE_HOME=/tmp/fh
 python3 tests/seed_tools_home.py /tmp/fh3 && FAKE_HOME=/tmp/fh3 node tests/ui_tools.js
