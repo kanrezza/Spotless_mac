@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -2620,7 +2620,8 @@ def bundle_meta(b):
 
 
 def is_sys_path(p):
-    if not p.startswith("/") or p.startswith(USER_PREFIX) or "/System/Applications/" in p or p.startswith(HOME + "/"):
+    if not p.startswith("/") or p.startswith(USER_PREFIX) or "/System/Applications/" in p or p.startswith(HOME + "/") \
+            or "/AppTranslocation/" in p:  # app mở thẳng từ Tải về (macOS chạy bản sao tạm trong /private/var)
         return False
     return p.startswith(SYS_PREFIX)
 
@@ -2917,7 +2918,7 @@ def activity_suggest(groups, mem):
     for g in groups:
         for p in g["procs"]:
             if any(f["lv"] == "bad" for f in p["flags"]) and p["killable"]:
-                sug.append({"lv": "bad", "t": f"{p['name']}" + (f" (của {p['owner']})" if p["owner"] else "")
+                sug.append({"lv": "bad", "t": f"{p['name']}" + (f" (của {p['owner']})" if p["owner"] else f" (ở {home_short(os.path.dirname(p['path']))})")
                             + f" đang dùng {p['cpu']:.0f}% CPU dù lẽ ra gần như 0%: bị kẹt. Buộc dừng an toàn, app chủ vẫn chạy.",
                             "act": {"kind": "kill", "pid": p["pid"], "name": p["name"], "label": "Buộc dừng"}})
     if mem and mem["pressure"] in ("warn", "critical"):
@@ -3844,7 +3845,7 @@ padding:12px 18px;border-radius:12px;max-width:min(640px,92vw);box-shadow:0 8px 
 .subseg{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 14px}
 .subseg button{background:var(--card);border-radius:18px;padding:5px 14px;font-weight:500}
 .subseg button.on{background:var(--accent);color:#fff}
-#v-tools,#v-machine{overflow:auto;padding-bottom:24px}
+#v-tools,#v-machine,#v-activity{overflow:auto;padding-bottom:24px}
 .tinfo{margin-bottom:12px}.tinfo h2{margin:0 0 3px;font-size:17px}.tinfo p{margin:0;color:var(--muted)}
 .tbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 12px;background:var(--card);border-radius:12px;padding:10px 12px}
 .tbar .sum{font-weight:600;margin:0 6px}.tbar .grow{margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
@@ -4429,7 +4430,7 @@ function renderActivity(){
   const cpu=x=>String(x).replace(".",",")+"%";
   $("a-list").innerHTML=`<div class="card" style="padding:8px 8px 4px"><div class="ahead"><span></span><span>Ứng dụng / tiến trình (${gs.length})</span><span class="r">Tiến trình</span><span class="r">RAM</span><span class="r">CPU</span></div>
     ${gs.slice(0,lim).map(g=>{const op=AC.open.has(g.key),bad=g.flags.some(f=>f.lv==="bad"),pct=(AC.sort==="cpu"?g.cpu:g.mem)/max*100;
-      return `<div class="arow ${op?"open":""} ${g.system?"sys":""} ${g.flags.length?"hot":""}" data-agrp="${esc(g.key)}">
+      return `<div class="arow ${op?"open":""} ${g.system?"sys":""} ${(g.cpu>=80||bad)?"hot":""}" data-agrp="${esc(g.key)}">
         <span class="caret">▸</span><span class="an">${esc(g.label)} ${g.system?`<span class="badge b-review" style="background:var(--alt);color:var(--muted)">hệ thống</span>`:""}
           ${bad?`<span class="badge b-careful">bất thường</span>`:g.flags.length?`<span class="badge b-review">chú ý</span>`:""}
           ${g.browser?`<span class="badge b-safe">trình duyệt</span>`:""}${g.owner?` <span class="mut">· mở bởi ${esc(g.owner)}</span>`:""}</span>
