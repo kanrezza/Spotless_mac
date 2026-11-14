@@ -16,3 +16,8 @@
 - `ps` chạy với `LC_ALL=C` để số thập phân dùng dấu chấm.
 - macOS không cho biết tab nào ứng với tiến trình renderer nào; đo chính xác dùng `performance.memory.usedJSHeapSize` qua AppleScript (cần bật “Cho phép JavaScript từ Apple Events”).
 - Kiểm thử: `tests/test_activity.py`, `tests/ui_activity.js` (dữ liệu giả qua `tests/act_harness.py`).
+
+## Bổ sung v5.3.0
+- **US7**: Bấm từng phần của thanh RAM (Ứng dụng, Hệ thống giữ cố định, Đã nén, Bộ nhớ đệm file, Swap) để xem giải thích. Phần Ứng dụng liệt kê các app chiếm RAM kèm câu trả lời “Có nên đóng không?” và số RAM lấy lại được.
+- **US8**: Mỗi app có nhãn quyết định: Nên đóng / Có thể đóng / Đang hoạt động / Nhẹ, cứ để / Hệ thống / Có tiến trình kẹt, dựa trên: đang rảnh hay không (CPU ~18 giây gần nhất), dung lượng, loại app (máy ảo, IDE, Docker), áp lực bộ nhớ, mở 2 trình duyệt cùng lúc.
+- **US9**: Chi tiết app: % RAM máy, CPU lúc này/trung bình, thời gian chạy, xu hướng RAM (cảnh báo rò rỉ khi tăng đều >100 MB/phút), RAM chia theo loại tiến trình (trang web, tiện ích, GPU…).

@@ -27,8 +27,17 @@ const ok = m => console.log('✓ ' + m);
     const sug = await p.$eval('#a-sug', x => x.textContent);
     if (scheme === 'light' && (!sug.includes('chrome_crashpad_handler') || !sug.includes('bị kẹt'))) fail('gợi ý thiếu crashpad'); ok('gợi ý nêu crashpad bị kẹt');
     const first = await p.$eval('#a-list .arow .an', x => x.textContent);
-    if (!first.includes('Claude')) fail('dòng đầu theo RAM phải là Claude: ' + first); ok('sắp theo RAM, Claude đứng đầu');
+    if (!first.includes('qemu')) fail('dòng đầu theo RAM phải là qemu: ' + first); ok('sắp theo RAM, qemu (5 GB) đứng đầu');
     if (scheme === 'light') {
+      const mp = await p.$eval('.mpanel', x => x.textContent);
+      if (!mp.includes('gồm những gì') || !mp.includes('Có nên đóng không') || !mp.includes('qemu-system-aarch64') || !mp.includes('Nên đóng')) fail('bảng Ứng dụng thiếu: ' + mp);
+      ok('bấm Ứng dụng → bảng app + có nên đóng');
+      await p.screenshot({path: `${OUT}/activity-mem.png`});
+      await p.click('.alg [data-amem=wired]');
+      if (!(await p.$eval('.mpanel', x => x.textContent)).includes('máy ảo')) fail('giải thích wired thiếu'); ok('giải thích Hệ thống giữ cố định');
+      await p.click('.alg [data-amem=app]');
+      await p.click('.mpanel [data-aopen] >> nth=0');
+      if (!(await p.$eval('.adet', x => x.textContent)).includes('Có nên đóng?')) fail('chi tiết thiếu Có nên đóng'); ok('chi tiết app có “Có nên đóng?” + số liệu');
       await p.click('[data-asort=cpu]'); ok('đổi sang Theo CPU');
       await p.click('[data-asort=mem]');
       await p.click('#a-sug [data-atabs]');

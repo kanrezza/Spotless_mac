@@ -18,6 +18,8 @@ MAIN = f"""{victim.pid} 1 {me} 12000 171.2 2-04:00:00 440:49.03 {CH}
 401 1 _windowserver 500000 12.7 9-00:00:00 1535:07.60 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
 0 0 root 0 8.9 9-00:00:00 1352:03.10 kernel_task
 5000 1 {me} 150000 0.5 00:10:00 0:03.00 /opt/homebrew/bin/node
+7000 1 {me} 5000000 0.0 05:00:00 1:00.00 /Users/x/Library/Android/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64
+7100 1 {me} 860000 0.0 05:00:00 1:00.00 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 """
 ARGS = "41983 x --type=renderer\n41924 x --type=renderer --extension-process\n"
 VM = """Mach Virtual Memory Statistics: (page size of 16384 bytes)

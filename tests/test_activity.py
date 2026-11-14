@@ -51,4 +51,18 @@ check(t[0]["js_err"] == "off" and t[0]["heap"] is None and t[0]["id"] == "7", "�
 check(d.aq('a"b\\c') == '"a\\"b\\\\c"', "thoát chuỗi AppleScript")
 check(d.browser_tabs("com.evil.app").get("error"), "từ chối trình duyệt không hỗ trợ")
 check(not d.tab_action("com.brave.Browser", "1", "2", "x", "", "close")["ok"], "từ chối tab không hợp lệ")
+PS2 = PS + f"""7000 1 {me} 5000000 0.0 05:00:00 1:00.00 /Users/x/Library/Android/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64
+7100 1 {me} 200000 0.0 05:00:00 1:00.00 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+7200 1 {me} 50000 0.0 05:00:00 1:00.00 /Applications/AltTab.app/Contents/MacOS/AltTab
+"""
+g2 = {x["label"]: x for x in d.proc_snapshot(PS2, "", mem)}
+check(g2["qemu-system-aarch64"]["verdict"]["v"] == "close", "máy ảo rảnh 5 GB → Nên đóng")
+check(g2["Google Chrome"]["verdict"]["v"] in ("close", "maybe") and "Brave" in g2["Google Chrome"]["verdict"]["t"], "2 trình duyệt → gợi ý đóng cái nhỏ hơn")
+check(g2["WindowServer"]["verdict"]["v"] == "sys" and g2["AltTab"]["verdict"]["v"] == "keep", "hệ thống → Hệ thống; app nhẹ → cứ để")
+check(g2["Claude"]["verdict"]["v"] == "fix", "app có tiến trình kẹt → chỉ cần buộc dừng tiến trình đó")
+check(all(x["verdict"]["t"] for x in g2.values()), "mọi nhóm có lời giải thích có nên đóng")
+s2 = d.activity_suggest(list(g2.values()), mem)
+check(any("Nên đóng" in x["t"] and "qemu" in x["t"] for x in s2), "gợi ý tổng: Nên đóng qemu")
+check(d.verdict({"label": "X", "bid": "", "mem": 2 * d.GB, "cpu": 0.0, "idle": True, "flags": [], "system": False,
+                  "browser": "", "self": False}, dict(mem, pressure="warn"))["v"] == "close", "app rảnh 2 GB khi thiếu RAM → Nên đóng")
 print(f"\nALL ACTIVITY TESTS PASSED ({n} kiểm tra)")

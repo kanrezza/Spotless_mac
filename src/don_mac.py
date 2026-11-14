@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.2.1"
+VERSION = "5.3.0"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -2514,7 +2514,22 @@ SAFARI_IDS = {"com.apple.Safari": "Safari", "com.apple.SafariTechnologyPreview":
 BUNDLE_ID_GUESS = {"Brave Browser": "com.brave.Browser", "Google Chrome": "com.google.Chrome", "Microsoft Edge": "com.microsoft.edgemac",
                    "Vivaldi": "com.vivaldi.Vivaldi", "Opera": "com.operasoftware.Opera", "Chromium": "org.chromium.Chromium",
                    "Arc": "company.thebrowser.Browser", "Safari": "com.apple.Safari", "Claude": "com.anthropic.claudefordesktop"}
+def hd(n):
+    """Dung lượng kiểu thập phân giống giao diện (và Giám sát hoạt động): 1 GB = 1000³ byte."""
+    n = float(n or 0)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or u == "TB":
+            s = f"{n:.0f}" if u in ("B", "KB") or n >= 100 else (f"{n:.1f}" if n >= 10 else f"{n:.2f}")
+            return s.replace(".", ",") + " " + u
+        n /= 1000
+
+
 PROC_HIST = {}
+GROUP_HIST = {}  # key -> [(thời điểm, RAM, CPU)] ~2 phút gần nhất
+HEAVY_KINDS = ("qemu", "virtualization", "emulator", "android studio", "orbstack", "docker", "xcode", "simulator",
+               "intellij", "pycharm", "webstorm", "goland", "rider", "clion", "parallels", "vmware", "utm", "virtualbox")
+VERDICT_LABEL = {"close": "Nên đóng", "maybe": "Có thể đóng", "using": "Đang hoạt động", "keep": "Nhẹ, cứ để",
+                 "sys": "Hệ thống", "fix": "Có tiến trình kẹt", "self": "Spotless Mac"}
 _APPINFO = {}
 _LIBC = [None]
 
@@ -2613,7 +2628,7 @@ def outer_bundle(path):
 def bundle_meta(b):
     if b not in _APPINFO:
         info = app_info(b)
-        _APPINFO[b] = {"name": info.get("CFBundleDisplayName") or info.get("CFBundleName") or os.path.basename(b)[:-4],
+        _APPINFO[b] = {"name": os.path.basename(b)[:-4] or info.get("CFBundleDisplayName") or info.get("CFBundleName"),
                        "bid": info.get("CFBundleIdentifier") or BUNDLE_ID_GUESS.get(os.path.basename(b)[:-4], ""),
                        "electron": os.path.isdir(os.path.join(b, "Contents/Frameworks/Electron Framework.framework"))}
     return _APPINFO[b]
@@ -2907,10 +2922,73 @@ def proc_snapshot(ps_main=None, ps_args=None, mem=None):
         if total and g["mem"] >= total * 0.15:
             g["flags"].append({"lv": "warn", "t": f"Chiếm {g['mem'] / total * 100:.0f}% RAM của máy"})
         g["info"] = explain_group(g)
+        g["self"] = bool(mine) and g["bundle"] == mine
+        now = time.time()
+        h = GROUP_HIST.setdefault(g["key"], [])
+        h.append((now, g["mem"], g["cpu"]))
+        del h[:-40]
+        g["etime"] = max(x["etime"] for x in g["procs"])
+        g["avg"] = round(sum(x["avg"] for x in g["procs"]), 1)
+        span = h[-1][0] - h[0][0]
+        g["trend"] = int((h[-1][1] - h[0][1]) / span * 60) if span >= 45 else None
+        g["idle"] = (max(c for _, _, c in h[-6:]) < 1.0) if len(h) >= 5 else g["cpu"] < 0.5
+        bd = {}
+        for x in g["procs"]:
+            k = x["type"] or "other"
+            m0, n0 = bd.get(k, (0, 0))
+            bd[k] = (m0 + x["mem"], n0 + 1)
+        g["breakdown"] = [{"type": k, "label": PTYPE_LABEL.get(k, "Tiến trình chính và khác"), "mem": v[0], "n": v[1]}
+                          for k, v in sorted(bd.items(), key=lambda kv: -kv[1][0])] if len(bd) > 1 else []
         g["procs"] = g["procs"][:40]
         out.append(g)
+    live = {g["key"] for g in out}
+    for k in list(GROUP_HIST):
+        if k not in live:
+            del GROUP_HIST[k]
     out.sort(key=lambda g: -g["mem"])
+    browsers = [g for g in out if g["browser"] and not g["system"]]
+    for g in out:
+        g["verdict"] = verdict(g, mem, browsers)
     return out
+
+
+def verdict(g, mem, browsers=()):
+    """Có nên đóng app/tiến trình này không: v (close/maybe/using/keep/sys/fix/self) + lời giải thích cụ thể."""
+    pressure = (mem or {}).get("pressure", "normal")
+    size = hd(g["mem"])
+    name = g["label"].lower()
+    kind = "heavy" if any(k in name or k in (g.get("bid") or "").lower() for k in HEAVY_KINDS) else ""
+
+    def V(v, t):
+        return {"v": v, "label": VERDICT_LABEL[v], "t": t, "save": g["mem"] if v in ("close", "maybe") else 0}
+    if g.get("self"):
+        return V("self", "Chính app này. Nhẹ, và tự tắt khi bạn đóng cửa sổ.")
+    if any(f["lv"] == "bad" for f in g["flags"]):
+        return V("fix", "Không cần đóng cả app: chỉ cần buộc dừng tiến trình bị kẹt (dòng đỏ bên dưới). App vẫn dùng bình thường.")
+    if g["system"]:
+        return V("sys", "Thành phần của macOS. Không cần và không nên đóng; macOS tự quản lý bộ nhớ của nó.")
+    if g["mem"] < 150 * MB:
+        return V("keep", f"Chỉ dùng {size}: đóng cũng không lấy lại được bao nhiêu RAM.")
+    other = [b for b in browsers if b is not g]
+    if g["browser"] and other and g["mem"] <= max(b["mem"] for b in other):
+        big = max(other, key=lambda b: b["mem"])
+        return V("close" if g["idle"] or pressure != "normal" else "maybe",
+                 f"Bạn đang mở cùng lúc {g['label']} và {big['label']}. Nếu không cần cả hai, đóng {g['label']} lấy lại khoảng {size}.")
+    if g["browser"]:
+        return V("using" if not g["idle"] else "maybe",
+                 f"Đừng đóng cả trình duyệt nếu đang dùng: bấm “Xem tab” và đóng các tab nặng bạn không xem. "
+                 f"Đóng hẳn {g['label']} sẽ lấy lại khoảng {size}.")
+    if not g["idle"]:
+        return V("using", f"Đang chạy (dùng {g['cpu']:.1f}% CPU), có thể bạn đang dùng. Nếu không, đóng để lấy lại khoảng {size}.")
+    if kind and g["mem"] >= 500 * MB:
+        return V("close", f"Đang rảnh nhưng giữ {size}. Loại app này (máy ảo, IDE, Docker) chiếm RAM cố định dù không làm gì: "
+                          "nếu không dùng trong lúc này thì nên đóng.")
+    if g["mem"] >= GB and pressure != "normal":
+        return V("close", f"Đang rảnh nhưng giữ {size} trong lúc máy thiếu RAM. Nên đóng nếu không dùng ngay.")
+    if g["mem"] >= 300 * MB:
+        return V("maybe", f"Đang rảnh, giữ {size}. " + ("RAM còn đủ nên không bắt buộc; đóng nếu bạn không định dùng lại sớm."
+                                                       if pressure == "normal" else "Máy đang thiếu RAM: đóng nếu không dùng."))
+    return V("keep", f"Dùng {size}, đang rảnh. Không đáng đóng trừ khi bạn không dùng nữa.")
 
 
 def activity_suggest(groups, mem):
@@ -2925,21 +3003,26 @@ def activity_suggest(groups, mem):
         sug.append({"lv": "bad" if mem["pressure"] == "critical" else "warn",
                     "t": "Áp lực bộ nhớ đang " + ("đỏ" if mem["pressure"] == "critical" else "vàng")
                          + ": RAM không đủ nên macOS phải nén và đẩy ra ổ đĩa (swap), máy sẽ chậm. Đóng bớt các app/tab nặng dưới đây."})
+    close = [g for g in groups if g["verdict"]["v"] == "close"]
+    if close:
+        sug.append({"lv": "warn" if mem and mem["pressure"] != "normal" else "info",
+                    "t": f"Nên đóng: {', '.join(g['label'] for g in close[:5])}. Đang rảnh nhưng giữ tổng khoảng "
+                         f"{hd(sum(g['mem'] for g in close))} RAM.", "act": {"kind": "open", "key": close[0]["key"], "label": "Xem lý do"}})
     n = 0
     for g in groups:
         if n >= 3 or g["mem"] < 400 * MB:
             break
-        if g["system"]:
+        if g["system"] or g in close or g.get("self"):
             continue
         n += 1
         if g["browser"]:
-            sug.append({"lv": "info", "t": f"{g['label']} dùng {human(g['mem'])} qua {g['n']} tiến trình. Xem tab nào nặng nhất để đóng.",
+            sug.append({"lv": "info", "t": f"{g['label']} dùng {hd(g['mem'])} qua {g['n']} tiến trình. Xem tab nào nặng nhất để đóng.",
                         "act": {"kind": "tabs", "key": g["key"], "label": "Xem tab"}})
         else:
-            sug.append({"lv": "info", "t": f"{g['label']} dùng {human(g['mem'])}. {g['info']['act']}",
+            sug.append({"lv": "info", "t": f"{g['label']} dùng {hd(g['mem'])}. {g['info']['act']}",
                         "act": {"kind": "open", "key": g["key"], "label": "Chi tiết"}})
     if mem and mem["pressure"] == "normal" and mem["swap_used"] > 2 * GB:
-        sug.append({"lv": "info", "t": f"Đang dùng {human(mem['swap_used'])} swap (RAM tràn ra ổ đĩa). Không sao nếu máy vẫn mượt; "
+        sug.append({"lv": "info", "t": f"Đang dùng {hd(mem['swap_used'])} swap (RAM tràn ra ổ đĩa). Không sao nếu máy vẫn mượt; "
                                        "khởi động lại máy sẽ xóa sạch swap."})
     return sug
 
@@ -3784,6 +3867,15 @@ button.badge:hover{filter:brightness(.95)}
 .tr.sel{background:var(--sel)!important;color:var(--seltext)}.tr.sel .go,.tr.sel .mut{color:var(--seltext)}
 .tr.lock{opacity:.62}
 .mut{color:var(--muted)}
+.b-info{color:var(--accent);background:rgba(10,132,255,.13)}.b-mute{color:var(--muted);background:var(--alt)}
+.amem>div{cursor:pointer}.alg button{font:inherit;font-size:12.5px;background:none;padding:2px 6px;border-radius:6px;color:var(--text)}
+.alg button.on{background:var(--alt);font-weight:600}.alg button:hover{background:var(--alt)}
+.mpanel{background:var(--alt);border-radius:10px;padding:10px 12px;margin-top:10px;font-size:13px}.mpanel p{margin:0 0 6px}
+.mpanel .ans{font-weight:600;margin:4px 0 8px}.vt{font-size:12px;color:var(--muted)}
+.astats{display:flex;flex-wrap:wrap;gap:4px 18px;font-size:12.5px;color:var(--muted);margin:4px 0 8px}.astats b{color:var(--text);font-weight:600}
+.verd{border-radius:10px;padding:8px 12px;margin:6px 0 8px;font-size:13px;background:var(--alt)}.verd .badge{margin-right:6px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}.chips span{background:var(--alt);border-radius:12px;padding:3px 10px;font-size:12px}
+.trend{font-size:11px;margin-left:4px}.trend.up{color:var(--careful)}.trend.dn{color:var(--safe)}
 .atools{align-items:center}.atools input[type=search]{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text);min-width:220px}
 .amem{display:flex;height:12px;border-radius:6px;overflow:hidden;background:var(--line);margin:8px 0 6px}
 .amem>div{height:100%}.c-app{background:#0a84ff}.c-wired{background:#ff9f0a}.c-comp{background:#bf5af2}
@@ -4377,7 +4469,16 @@ async function toolDelete(n){
 }
 
 /* ================= 004: Hoạt động ================= */
-const AC={data:null,sort:"mem",open:new Set(),tabs:{},timer:null,paused:false,hideSys:false,q:"",more:false,downAt:0,busy:false};
+const AC={data:null,sort:"mem",open:new Set(),tabs:{},timer:null,paused:false,hideSys:false,q:"",more:false,downAt:0,busy:false,memOpen:"app"};
+const VB={close:"b-careful",maybe:"b-review",using:"b-info",keep:"b-mute",sys:"b-mute",fix:"b-careful",self:"b-mute"};
+const vbadge=v=>v?`<span class="badge ${VB[v.v]||"b-mute"}">${esc(v.label)}</span>`:"";
+const trendH=t=>t==null||Math.abs(t)<30e6?"":`<span class="trend ${t>0?"up":"dn"}">${t>0?"↑":"↓"} ${human(Math.abs(t))}/phút</span>`;
+const MEMINFO={
+  app:["Ứng dụng","RAM mà các app và tiến trình đang giữ để chạy: tab, tài liệu, dữ liệu đang mở. Đây là phần bạn giảm được bằng cách đóng app/tab."],
+  wired:["Hệ thống giữ cố định","Nhân macOS, driver, bộ nhớ đồ họa và RAM cấp cho máy ảo đang chạy. Phần này không nén, không đẩy ra ổ đĩa được. Không giải phóng trực tiếp; tắt máy ảo (OrbStack, Docker, Android Emulator) sẽ giảm."],
+  comp:["Đã nén","RAM lâu không dùng được macOS nén lại để nhường chỗ cho app khác. Nén ít là bình thường; nén nhiều (vài GB) nghĩa là RAM đang thiếu, CPU phải tốn công nén/giải nén nên máy hơi chậm. Đóng app rảnh sẽ giảm."],
+  cache:["Bộ nhớ đệm file","File vừa đọc được giữ lại trong RAM để mở lại nhanh hơn. Đây không phải RAM “bị chiếm”: macOS tự bỏ ngay khi app cần chỗ. Không cần làm gì."],
+  swap:["Swap","Phần RAM bị đẩy tạm ra ổ SSD khi thiếu. Vài GB trên máy 16 GB là chuyện thường; nếu nó tăng liên tục và máy chậm thì nên đóng app. Khởi động lại máy sẽ xóa sạch swap."]};
 try{AC.sort=localStorage.getItem("donmac.asort")||"mem";AC.hideSys=localStorage.getItem("donmac.asys")==="1"}catch(e){}
 const PRESS={normal:["Bình thường","d-safe","RAM đủ dùng. “Đã dùng” cao không có nghĩa là xấu: macOS cố tình dùng RAM trống làm bộ nhớ đệm cho nhanh. Điều cần xem là Áp lực bộ nhớ."],
   warn:["Cao","d-review","RAM sắp không đủ: macOS đang nén bộ nhớ và đẩy ra ổ đĩa (swap). Đóng bớt app/tab nặng để máy mượt lại."],
@@ -4411,11 +4512,12 @@ function renderActivity(){
   if(m){const P=PRESS[m.pressure]||PRESS.normal,w=x=>(x/m.total*100).toFixed(1)+"%";
     $("a-sum").innerHTML=`<div class="card"><h2 class="apress"><span class="dot ${P[1]}"></span>Áp lực bộ nhớ: ${P[0]}</h2>
       <p class="k">${P[2]}</p>
-      <div class="amem"><div class="c-app" style="width:${w(m.app)}"></div><div class="c-wired" style="width:${w(m.wired)}"></div><div class="c-comp" style="width:${w(m.compressed)}"></div></div>
-      <div class="alg"><span><b>${human(m.used)}</b> / ${human(m.total)} đã dùng</span>
-        <span><i class="c-app"></i>Ứng dụng ${human(m.app)}</span><span><i class="c-wired"></i>Hệ thống giữ cố định ${human(m.wired)}</span>
-        <span><i class="c-comp"></i>Đã nén ${human(m.compressed)}</span><span>Bộ nhớ đệm file ${human(m.cached)}</span>
-        <span>Swap ${human(m.swap_used)}</span><span>CPU tổng ${String(r.cpu).replace(".",",")}% (${r.ncpu} nhân)</span></div></div>`;
+      <div class="amem"><div class="c-app" data-amem="app" title="Ứng dụng" style="width:${w(m.app)}"></div><div class="c-wired" data-amem="wired" title="Hệ thống giữ cố định" style="width:${w(m.wired)}"></div><div class="c-comp" data-amem="comp" title="Đã nén" style="width:${w(m.compressed)}"></div></div>
+      <div class="alg"><span style="padding:2px 0"><b>${human(m.used)}</b> / ${human(m.total)} đã dùng</span>
+        ${[["app","c-app",m.app],["wired","c-wired",m.wired],["comp","c-comp",m.compressed],["cache","",m.cached],["swap","",m.swap_used]].map(([k,c,v])=>
+          `<button data-amem="${k}" class="${AC.memOpen===k?"on":""}">${c?`<i class="${c}"></i>`:""}${MEMINFO[k][0]} ${human(v)} ▾</button>`).join("")}
+        <span style="padding:2px 0">CPU tổng ${String(r.cpu).replace(".",",")}% (${r.ncpu} nhân)</span></div>
+      ${AC.memOpen?memPanel(r,m):""}</div>`;
   }else $("a-sum").innerHTML=`<div class="card"><h2>Bộ nhớ</h2><p class="k">Chỉ đọc được số liệu RAM trên macOS. CPU tổng ${r.cpu}%.</p></div>`;
   const ic={bad:"⛔",warn:"⚠️",info:"💡"};
   $("a-sug").innerHTML=r.suggest.length?`<div class="card"><h2>Nên làm gì bây giờ</h2>${r.suggest.map(s=>{const a=s.act;let b="";
@@ -4431,16 +4533,45 @@ function renderActivity(){
   $("a-list").innerHTML=`<div class="card" style="padding:8px 8px 4px"><div class="ahead"><span></span><span>Ứng dụng / tiến trình (${gs.length})</span><span class="r">Tiến trình</span><span class="r">RAM</span><span class="r">CPU</span></div>
     ${gs.slice(0,lim).map(g=>{const op=AC.open.has(g.key),bad=g.flags.some(f=>f.lv==="bad"),pct=(AC.sort==="cpu"?g.cpu:g.mem)/max*100;
       return `<div class="arow ${op?"open":""} ${g.system?"sys":""} ${(g.cpu>=80||bad)?"hot":""}" data-agrp="${esc(g.key)}">
-        <span class="caret">▸</span><span class="an">${esc(g.label)} ${g.system?`<span class="badge b-review" style="background:var(--alt);color:var(--muted)">hệ thống</span>`:""}
-          ${bad?`<span class="badge b-careful">bất thường</span>`:g.flags.length?`<span class="badge b-review">chú ý</span>`:""}
+        <span class="caret">▸</span><span class="an">${esc(g.label)} ${vbadge(g.verdict)}
           ${g.browser?`<span class="badge b-safe">trình duyệt</span>`:""}${g.owner?` <span class="mut">· mở bởi ${esc(g.owner)}</span>`:""}</span>
-        <span class="r mut">${g.n}</span><span class="r">${human(g.mem)}</span><span class="r acpu">${cpu(g.cpu)}</span>
+        <span class="r mut">${g.n}</span><span class="r">${human(g.mem)}${trendH(g.trend)}</span><span class="r acpu">${cpu(g.cpu)}</span>
         <div class="abar"><div style="width:${pct.toFixed(1)}%"></div></div></div>${op?groupDetail(g):""}`}).join("")}
     ${gs.length>lim?`<div style="padding:8px"><button class="link" id="amore">Hiện thêm ${gs.length-lim} mục</button></div>`:""}</div>`;
 }
+function memPanel(r,m){
+  const k=AC.memOpen,[t,d]=MEMINFO[k];
+  if(k!=="app")return `<div class="mpanel"><p><b>${t}</b></p><p>${d}</p>${k==="wired"?wiredHint(r):""}</div>`;
+  const us=r.groups.filter(g=>!g.system&&!g.self),sum=us.reduce((a,g)=>a+g.mem,0),top=us.slice(0,12),mx=Math.max(1,...top.map(g=>g.mem));
+  const cl=us.filter(g=>g.verdict.v==="close"),mb=us.filter(g=>g.verdict.v==="maybe");
+  const save=cl.reduce((a,g)=>a+g.mem,0),save2=mb.reduce((a,g)=>a+g.mem,0);
+  const ans=m.pressure==="normal"
+    ?`Chưa bắt buộc: Áp lực bộ nhớ bình thường nên RAM còn đủ. ${cl.length?`Tuy vậy ${cl.map(g=>g.label).join(", ")} đang rảnh mà giữ ${human(save)}, đóng đi máy sẽ thoáng hơn.`:"Chỉ đóng nếu máy chậm."}`
+    :`Có: máy đang thiếu RAM. ${cl.length?`Đóng ${cl.map(g=>g.label).join(", ")} lấy lại khoảng ${human(save)}.`:"Đóng bớt các app lớn dưới đây mà bạn không dùng."}`;
+  return `<div class="mpanel"><p><b>Ứng dụng ${human(m.app)} gồm những gì?</b> ${d}</p>
+    <p class="ans">Có nên đóng không? ${esc(ans)}${save2?` Nếu cần thêm, các app “Có thể đóng” giữ thêm ${human(save2)}.`:""}</p>
+    <table class="mini"><tr><th>App</th><th class="r">RAM</th><th style="width:22%"></th><th>Có nên đóng?</th><th></th></tr>
+    ${top.map(g=>`<tr><td><b>${esc(g.label)}</b>${trendH(g.trend)}</td><td class="num">${human(g.mem)}</td><td><div class="bar" style="margin:0"><div style="width:${(g.mem/mx*100).toFixed(0)}%"></div></div></td>
+      <td>${vbadge(g.verdict)}<div class="vt">${esc(g.verdict.t)}</div></td><td class="r"><button class="link" data-aopen="${esc(g.key)}">Chi tiết</button></td></tr>`).join("")}</table>
+    <p class="vt" style="margin-top:6px">Tổng RAM của các app (${human(sum)}) có thể khác con số Ứng dụng vì mỗi app được tính cả phần đã bị nén, giống cột Bộ nhớ của Giám sát hoạt động.</p></div>`;
+}
+function wiredHint(r){
+  const vm=r.groups.filter(g=>/qemu|virtualization|orbstack|docker|emulator|vmware|parallels|utm/i.test(g.label+" "+(g.bid||"")));
+  return vm.length?`<p>Máy ảo đang chạy: <b>${vm.map(g=>esc(g.label)+" "+human(g.mem)).join(", ")}</b>. Tắt chúng khi không dùng sẽ giảm phần này.</p>`:"";
+}
 function groupDetail(g){
   const risk=g.flags.some(f=>f.lv==="bad")?"careful":g.system?"safe":"review";
-  let h=`<div class="adet">${g.flags.map(f=>`<div class="aflag ${f.lv}">${f.lv==="bad"?"⛔":"⚠️"} ${esc(f.t)}</div>`).join("")}${infoBox(g.info,risk)}<div class="btns">`;
+  const tot=AC.data.mem?AC.data.mem.total:0;
+  let h=`<div class="adet"><div class="verd"><b>Có nên đóng?</b> ${vbadge(g.verdict)}${esc(g.verdict.t)}</div>
+    ${g.flags.map(f=>`<div class="aflag ${f.lv}">${f.lv==="bad"?"⛔":"⚠️"} ${esc(f.t)}</div>`).join("")}
+    <div class="astats"><span>RAM <b>${human(g.mem)}</b>${tot?` (${(g.mem/tot*100).toFixed(1).replace(".",",")}% RAM máy)`:""}</span>
+      <span>CPU lúc này <b>${String(g.cpu).replace(".",",")}%</b></span><span>CPU trung bình <b>${String(g.avg).replace(".",",")}%</b></span>
+      <span>Đã chạy <b>${dur(g.etime)}</b></span><span><b>${g.n}</b> tiến trình</span>
+      <span>Xu hướng RAM <b>${g.trend==null?"đang theo dõi…":(Math.abs(g.trend)<30e6?"ổn định":(g.trend>0?"tăng ":"giảm ")+human(Math.abs(g.trend))+"/phút")}</b></span>
+      ${g.idle?`<span><b>Đang rảnh</b> (gần như không dùng CPU)</span>`:""}</div>
+    ${g.trend!=null&&g.trend>100e6?`<div class="aflag warn">⚠️ RAM đang tăng đều ${human(g.trend)}/phút. Nếu cứ tăng mãi khi bạn không làm gì, app có thể bị rò rỉ bộ nhớ: thoát và mở lại app sẽ lấy lại RAM.</div>`:""}
+    ${g.breakdown.length?`<div class="chips">${g.breakdown.map(b=>`<span>${esc(b.label)}: <b>${human(b.mem)}</b> (${b.n})</span>`).join("")}</div>`:""}
+    ${infoBox(g.info,risk)}<div class="btns">`;
   if(g.browser)h+=`<button class="small" data-atabs="${esc(g.key)}">🔍 Xem tab nào nặng nhất</button>`;
   if(g.can_quit)h+=`<button class="small" data-aquit="${esc(g.key)}">Thoát ${esc(g.label)}</button><button class="small" style="background:var(--danger)" data-aquit="${esc(g.key)}" data-force="1">Buộc thoát</button>`;
   h+=`</div>`;
@@ -4485,6 +4616,7 @@ document.addEventListener("click",async e=>{
   const so=e.target.closest("[data-asort]");if(so){AC.sort=so.dataset.asort;try{localStorage.setItem("donmac.asort",AC.sort)}catch(_){}renderActivity();return}
   if(e.target.closest("#apause")){AC.paused=!AC.paused;if(!AC.paused)pollActivity();renderActivity();return}
   if(e.target.closest("#amore")){AC.more=true;renderActivity();return}
+  const mm=e.target.closest("[data-amem]");if(mm){AC.memOpen=AC.memOpen===mm.dataset.amem?"":mm.dataset.amem;renderActivity();return}
   const k=e.target.closest("[data-akill]");
   if(k){const pid=+k.dataset.akill,name=k.dataset.aname;let p=null;for(const g of AC.data.groups)for(const x of g.procs)if(x.pid===pid)p=x;
     const note=p&&p.info&&p.info.close==="ok"?p.info.act:"Chương trình sẽ bị tắt ngay; dữ liệu chưa lưu trong nó sẽ mất. Nếu là tiến trình phụ của một app, phần tương ứng của app (ví dụ một tab) sẽ báo lỗi.";
