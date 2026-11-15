@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "6.2.0"
+VERSION = "6.3.0"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -3861,8 +3861,8 @@ def notify(text, title="Spotless Mac", subtitle=""):
 
 def watch_cfg():
     w = load_cfg().get("watch")
-    d = {"enabled": False, "stuck": True, "auto_kill": False, "battery": True, "pressure": True, "metrics": True,
-         "cpu": 90, "minutes": 5, "menu": False}
+    d = {"enabled": False, "stuck": True, "auto_kill": False, "battery": True, "slowcharge": True, "heat": True,
+         "pressure": True, "disk": True, "metrics": True, "cpu": 90, "minutes": 5, "disk_gb": 10, "menu": False}
     if isinstance(w, dict):
         d.update({k: w[k] for k in d if k in w})
     return d
@@ -3959,7 +3959,19 @@ def record_scan(items):
         pass
 
 
-def watch_once(now=None, ps_main=None, batt=None, level=None):
+def sustained(st, key, on, now, need, cooldown):
+    """True đúng một lần khi điều kiện đã đúng liên tục đủ lâu, và chưa báo trong khoảng cooldown."""
+    if not on:
+        st[key] = None
+        return False
+    st[key] = st.get(key) or now
+    if now - st[key] >= need - 5 and now - st.get(key + "_noted", 0) >= cooldown:
+        st[key + "_noted"] = now
+        return True
+    return False
+
+
+def watch_once(now=None, ps_main=None, batt=None, level=None, th=None, free=None):
     """Một lượt theo dõi nền (LaunchAgent gọi mỗi phút). Trả về danh sách sự kiện (để kiểm thử)."""
     cfg = watch_cfg()
     now = now or time.time()
@@ -4000,14 +4012,50 @@ def watch_once(now=None, ps_main=None, batt=None, level=None):
             procs[k] = rec
     st["procs"] = procs
     b = batt if batt is not None else (battery_info(light=True) if cfg["battery"] or cfg["metrics"] else None)
-    if cfg["battery"] and b and b["connected"] and b["batt_w"] <= -0.5:
+    if cfg["battery"] and b and b.get("connected") and b.get("batt_w", 0) <= -0.5:
         st["drain"] = st.get("drain") or now
         if now - st["drain"] >= mins * 60 - 5 and now - st.get("drain_noted", 0) >= 3600:
-            events.append(("battery", f"Pin đang tụt dù cắm sạc: máy dùng khoảng {b['sys_w'] or 0:.0f}W, nhiều hơn củ sạc "
-                                      f"{b['adapter_w'] or '?'}W cấp được. Mở Spotless Mac → Pin & tối ưu để xem app nào tốn điện."))
+            events.append(("battery", f"Pin đang tụt dù cắm sạc: máy dùng khoảng {b.get('sys_w') or 0:.0f}W, nhiều hơn củ sạc "
+                                      f"{b.get('adapter_w') or '?'}W cấp được. Mở Spotless Mac → Pin & tối ưu để xem app nào tốn điện."))
             st["drain_noted"] = now
     else:
         st["drain"] = None
+    pct = (b or {}).get("pct") or 0
+    if cfg["slowcharge"] and b and b.get("connected") and not b.get("full") and pct < 90 \
+            and -0.5 < b.get("batt_w", 0) < 3 and not (75 <= pct <= 85 and not b.get("charging")):
+        if sustained(st, "slow", True, now, mins * 60, 3 * 3600):
+            events.append(("slow", f"Pin đang sạc rất chậm ({b['batt_w']:.1f}W vào pin, pin {pct}%): máy dùng khoảng "
+                                   f"{b.get('sys_w') or 0:.0f}W trên củ sạc {b.get('adapter_w') or '?'}W. Đóng bớt app nặng, "
+                                   "hoặc dùng củ sạc mạnh hơn."))
+    else:
+        sustained(st, "slow", False, now, 0, 0)
+    if cfg["heat"]:
+        t = th if th is not None else thermal(batt=b)
+        hot = (t.get("sources") or [{}])[0].get("label", "")
+        if sustained(st, "heat", t["state"] == "throttle", now, mins * 60, 2 * 3600):
+            events.append(("heat", f"Máy nóng nên macOS đang ép CPU chạy chậm lại ({t['msg']})."
+                                   + (f" Đốt CPU nhiều nhất: {hot}." if hot else "")
+                                   + " Mở Spotless Mac → Pin & tối ưu → Nhiệt độ để đóng ngay."))
+        elif sustained(st, "warm", t["state"] == "hot", now, max(mins, 10) * 60, 6 * 3600):
+            tc = t.get("temp")
+            warm = f"Máy đang ấm lên (pin {tc:.0f}°C)" if tc else "Máy đang ấm lên"
+            events.append(("heat", warm + (f", chủ yếu do {hot}" if hot else "")
+                           + ". Chưa bị chậm, nhưng nên đóng bớt app nặng."))
+    if cfg["disk"]:
+        try:
+            fr = free if free is not None else shutil.disk_usage(HOME).free
+        except OSError:
+            fr = None
+        lim = max(1, int(cfg["disk_gb"])) * GB
+        if fr is not None and fr < lim and now - st.get("disk_noted", 0) >= 6 * 3600:
+            st["disk_noted"] = now
+            last = read_jsonl("scans.jsonl", 1)
+            big = ""
+            if last and last[-1].get("cats"):
+                k, v = max(last[-1]["cats"].items(), key=lambda kv: kv[1])
+                big = f" Lần quét gần nhất thấy {next((t2 for c, t2, _ in CATEGORIES if c == k), k)} đang chiếm {hd(v)}."
+            events.append(("disk", f"Ổ đĩa chỉ còn {hd(fr)} trống (dưới mức {cfg['disk_gb']} GB bạn đặt).{big}"
+                                   " Mở Spotless Mac để quét và dọn."))
     lv = level if level is not None else sh(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip()
     if cfg["pressure"] and str(lv) in ("2", "4"):
         st["press"] = st.get("press") or now
@@ -4023,7 +4071,8 @@ def watch_once(now=None, ps_main=None, batt=None, level=None):
     for kind, txt in events:
         watch_log(kind, txt)
         notify(txt, subtitle={"kill": "Đã xử lý tiến trình kẹt", "stuck": "Tiến trình bị kẹt", "battery": "Pin & sạc",
-                              "pressure": "Thiếu RAM"}.get(kind, ""))
+                              "pressure": "Thiếu RAM", "slow": "Sạc chậm", "heat": "Máy nóng",
+                              "disk": "Sắp hết dung lượng"}.get(kind, ""))
     if cfg["metrics"]:
         record_metric(batt=b)
     return events
@@ -4061,13 +4110,15 @@ def agent_set(label, plist):
 def watch_set(**kw):
     cfg = load_cfg()
     w = watch_cfg()
-    for k in ("enabled", "stuck", "auto_kill", "battery", "pressure", "metrics"):
+    for k in ("enabled", "stuck", "auto_kill", "battery", "slowcharge", "heat", "pressure", "disk", "metrics"):
         if k in kw:
             w[k] = bool(kw[k])
     if "cpu" in kw:
         w["cpu"] = max(30, min(400, int(kw["cpu"])))
     if "minutes" in kw:
         w["minutes"] = max(1, min(60, int(kw["minutes"])))
+    if "disk_gb" in kw:
+        w["disk_gb"] = max(1, min(500, int(kw["disk_gb"])))
     cfg["watch"] = w
     save_cfg(cfg)
     log = os.path.join(HOME, "Library/Logs/DonMac-watch.log")
@@ -5498,8 +5549,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/undo_do":
             self._json(undo_batch(str(body.get("batch", ""))))
         elif path == "/api/watch_set":
-            self._json(watch_set(**{k: v for k, v in body.items() if k in ("enabled", "stuck", "auto_kill", "battery", "pressure",
-                                                                         "metrics", "cpu", "minutes")}))
+            self._json(watch_set(**{k: v for k, v in body.items()
+                                    if k in ("enabled", "stuck", "auto_kill", "battery", "slowcharge", "heat", "pressure",
+                                             "disk", "metrics", "cpu", "minutes", "disk_gb")}))
         elif path == "/api/menu_set":
             self._json(menu_set(bool(body.get("enabled"))))
         elif path == "/api/agent_toggle":
@@ -6554,20 +6606,23 @@ function renderWatch(){
   const w=OP.watch;if(!w)return spinCard("Đang đọc cài đặt…");
   const ck=(k,t,d)=>`<label style="display:contents"><input type="checkbox" data-wk="${k}" ${w[k]?"checked":""}><span><b>${t}</b><div class="vt">${d}</div></span></label>`;
   return `<div class="card"><h2>Theo dõi nền ${w.installed?`<span class="badge b-safe">đang chạy</span>`:`<span class="badge b-mute">đang tắt</span>`}</h2>
-    <p class="k">Một tác vụ rất nhẹ chạy mỗi phút kể cả khi Spotless Mac đóng: phát hiện tiến trình bị kẹt, pin tụt khi cắm sạc, máy thiếu RAM, rồi gửi thông báo macOS. Đồng thời ghi lịch sử ổ đĩa, RAM, pin mỗi 30 phút cho mục Lịch sử.</p>
+    <p class="k">Một tác vụ rất nhẹ chạy mỗi phút kể cả khi Spotless Mac đóng: phát hiện tiến trình bị kẹt, pin tụt hoặc sạc chậm, máy nóng bị hạ xung, thiếu RAM và sắp hết dung lượng, rồi gửi thông báo macOS. Đồng thời ghi lịch sử ổ đĩa, RAM, pin mỗi 30 phút cho mục Lịch sử.</p>
     ${w.darwin?"":`<p class="mut">Chỉ dùng được trên macOS.</p>`}
     <div class="wopt">${ck("enabled","Bật theo dõi nền","Tắt là gỡ hẳn tác vụ nền.")}
       ${ck("stuck","Báo tiến trình ngốn CPU",`Khi một chương trình dùng ≥ <input type="number" data-wn="cpu" min="30" max="400" value="${w.cpu}">% CPU (crashpad: ≥ 20%) liên tục ≥ <input type="number" data-wn="minutes" min="1" max="60" value="${w.minutes}"> phút.`)}
       ${ck("auto_kill","Tự buộc dừng crashpad_handler bị kẹt","Chỉ áp dụng cho bộ báo cáo sự cố (an toàn: app chủ vẫn chạy). Các chương trình khác chỉ báo, không tự tắt.")}
-      ${ck("battery","Báo pin tụt khi đang cắm sạc","Kèm gợi ý mở tab Pin & sạc để xem app tốn điện.")}
+      ${ck("battery","Báo pin tụt khi đang cắm sạc","Máy dùng nhiều điện hơn củ sạc cấp được, nên pin vẫn hao dù đang cắm.")}
+      ${ck("slowcharge","Báo sạc chậm","Pin có lên nhưng rất chậm (dưới 3W vào pin) vì máy đang ngốn điện. Bỏ qua lúc macOS cố ý giữ pin ở 80%.")}
+      ${ck("heat","Báo máy nóng","Khi macOS ép CPU chạy chậm lại vì nhiệt, hoặc máy ấm kéo dài. Thông báo nói luôn app nào đang đốt CPU.")}
       ${ck("pressure","Báo máy thiếu RAM","Khi Áp lực bộ nhớ vàng/đỏ kéo dài.")}
+      ${ck("disk","Báo sắp hết dung lượng",`Khi ổ còn dưới <input type="number" data-wn="disk_gb" min="1" max="500" value="${w.disk_gb}"> GB trống. Thông báo kèm nhóm đang chiếm nhiều nhất ở lần quét gần nhất.`)}
       ${ck("metrics","Ghi lịch sử ổ đĩa, RAM, pin","Mỗi 30 phút một dòng nhỏ, giữ 60 ngày.")}</div>
     <button class="small" style="margin-left:0" id="wsave">Lưu</button></div>
   <div class="card"><h2>Biểu tượng trên thanh menu ${w.menu_installed?`<span class="badge b-safe">đang hiện</span>`:""}</h2>
     <p class="k">Biểu tượng nhỏ cạnh đồng hồ: <b>●</b>/<b>◐</b>/<b>◉</b> là Áp lực bộ nhớ (ổn/cao/quá tải) kèm % CPU; hiện <b>⚠︎</b> khi có tiến trình kẹt và <b>⚡︎</b> khi pin tụt dù cắm sạc. Bấm vào để xem RAM, pin, app nặng nhất và buộc dừng tiến trình kẹt bằng một cú bấm. Lần đầu bật cần biên dịch khoảng 10–30 giây.</p>
     <button class="small" style="margin-left:0" id="wmenu" ${OP.menuBusy?"disabled":""}>${OP.menuBusy?"Đang biên dịch…":w.menu_installed?"Ẩn biểu tượng":"Hiện biểu tượng trên thanh menu"}</button>
     ${OP.menuErr?`<div class="aflag bad">${esc(OP.menuErr)}</div>`:""}</div>
-  <div class="card"><h2>Nhật ký theo dõi</h2>${w.log.length?`<table class="mini">${w.log.map(x=>`<tr><td class="mut" style="white-space:nowrap">${esc(when(x.t))}</td><td>${{kill:"✅",stuck:"⚠️",battery:"🔋",pressure:"🧠"}[x.kind]||"•"} ${esc(x.text)}</td></tr>`).join("")}</table>`:`<span class="mut">Chưa có sự kiện nào.</span>`}</div>`;
+  <div class="card"><h2>Nhật ký theo dõi</h2>${w.log.length?`<table class="mini">${w.log.map(x=>`<tr><td class="mut" style="white-space:nowrap">${esc(when(x.t))}</td><td>${{kill:"✅",stuck:"⚠️",battery:"🔋",slow:"🐢",heat:"🌡",pressure:"🧠",disk:"💾"}[x.kind]||"•"} ${esc(x.text)}</td></tr>`).join("")}</table>`:`<span class="mut">Chưa có sự kiện nào.</span>`}</div>`;
 }
 function lineChart(pts,o={}){
   if(pts.length<2)return `<p class="mut">Chưa đủ dữ liệu.</p>`;

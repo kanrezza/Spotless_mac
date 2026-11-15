@@ -38,6 +38,17 @@ const ok = m => console.log('✓ ' + m);
     }
     await p.click('[data-osub=watch]');
     await p.waitForSelector('#wsave');
+    const wt = await p.$eval('#o-body', x => x.textContent);
+    for (const w of ['Báo sạc chậm', 'Báo máy nóng', 'Báo sắp hết dung lượng', 'Báo máy thiếu RAM'])
+      if (!wt.includes(w)) fail('thiếu tùy chọn thông báo: ' + w);
+    if (!(await p.$('[data-wn=disk_gb]'))) fail('thiếu ô đặt ngưỡng GB');
+    if (scheme === 'light') {
+      await p.fill('[data-wn=disk_gb]', '15');
+      await p.click('#wsave');
+      await p.waitForFunction(() => document.querySelector('[data-wn=disk_gb]') && document.querySelector('[data-wn=disk_gb]').value === '15', null, {timeout: 15000});
+      ok('lưu ngưỡng dung lượng 15 GB');
+    }
+    ok('Theo dõi nền: đủ 6 loại thông báo');
     await p.click('[data-osub=trends]');
     await p.waitForSelector('.chart', {timeout: 20000});
     const tr = await p.$eval('#o-body', x => x.textContent);

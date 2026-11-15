@@ -17,3 +17,9 @@
 
 ## Kiểm thử
 `tests/test_optim.py` (31 kiểm tra, gồm tự buộc dừng một tiến trình thật), `tests/ui_optim.js`.
+
+## Bổ sung v6.3.0 — thêm loại thông báo
+- **Sạc chậm**: đang cắm sạc, pin dưới 90%, chỉ 0–3W vào pin, kéo dài N phút → báo kèm W vào pin, mức máy đang dùng và công suất củ sạc. Bỏ qua khi macOS cố ý giữ pin quanh 80% (Sạc pin tối ưu).
+- **Máy nóng**: `thermal()` ở trạng thái `throttle` kéo dài N phút → báo kèm app đốt CPU nhiều nhất (nhắc lại tối đa 2 giờ/lần); trạng thái `hot` kéo dài ≥10 phút → nhắc nhẹ (tối đa 6 giờ/lần).
+- **Sắp hết dung lượng**: ổ còn dưới ngưỡng người dùng đặt (mặc định 10 GB) → báo kèm nhóm chiếm nhiều nhất ở lần quét gần nhất (tối đa 6 giờ/lần).
+- Hàm `sustained()` dùng chung cho mọi điều kiện cần “đúng liên tục đủ lâu mới báo”, kèm thời gian chờ giữa hai lần báo.

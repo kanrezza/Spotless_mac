@@ -75,6 +75,46 @@ kinds = [k for k, _ in ev2]
 check("stuck" in kinds and "battery" in kinds and "pressure" in kinds, "node 200% CPU 2 phút + pin tụt + thiếu RAM → 3 thông báo")
 check(kinds.count("stuck") == 1, "không báo lặp lại liên tục (mỗi 30 phút tối đa 1 lần)")
 
+# --- thông báo: sạc chậm, máy nóng, sắp hết ổ
+cfg["watch"] = {"enabled": True, "minutes": 2, "stuck": False, "metrics": False}; d.save_cfg(cfg)
+os.remove(d.wpath("watch_state.json"))
+SLOW = {"connected": True, "charging": True, "full": False, "pct": 55, "batt_w": 1.2, "sys_w": 28, "adapter_w": 30}
+ev3 = []
+for i in range(4):
+    ev3 += d.watch_once(now=t0 + 5000 + i * 60, ps_main="", batt=SLOW, level="1",
+                        th={"state": "ok", "msg": "", "sources": []}, free=500 * d.GB)
+check([k for k, _ in ev3] == ["slow"] and "1,2W" in ev3[0][1].replace(".", ",") and "30W" in ev3[0][1],
+      "sạc chậm 2 phút → báo đúng một lần, nêu W vào pin và củ sạc")
+os.remove(d.wpath("watch_state.json"))
+HOLD = dict(SLOW, pct=80, charging=False, batt_w=0.0)
+ev4 = []
+for i in range(4):
+    ev4 += d.watch_once(now=t0 + 9000 + i * 60, ps_main="", batt=HOLD, level="1",
+                        th={"state": "ok", "msg": "", "sources": []}, free=500 * d.GB)
+check(not ev4, "macOS cố ý giữ pin ở 80% thì không báo sạc chậm")
+os.remove(d.wpath("watch_state.json"))
+TH = {"state": "throttle", "msg": "macOS đang hạ xung CPU còn 62%", "temp": 41,
+      "sources": [{"label": "Brave Browser", "cpu": 150}]}
+ev5 = []
+for i in range(4):
+    ev5 += d.watch_once(now=t0 + 13000 + i * 60, ps_main="", batt={"connected": False, "batt_w": -5, "pct": 50, "full": False},
+                        level="1", th=TH, free=500 * d.GB)
+check([k for k, _ in ev5] == ["heat"] and "62%" in ev5[0][1] and "Brave Browser" in ev5[0][1],
+      "máy bị hạ xung 2 phút → báo kèm app đốt CPU")
+os.remove(d.wpath("watch_state.json"))
+d.record_scan([{"cat": "caches", "size": 12 * d.GB}, {"cat": "downloads", "size": 2 * d.GB}])
+ev6 = d.watch_once(now=t0 + 17000, ps_main="", batt=None, level="1", th={"state": "ok", "msg": "", "sources": []},
+                   free=7 * d.GB)
+check([k for k, _ in ev6] == ["disk"] and "7,52 GB" in ev6[0][1] and "Bộ nhớ đệm" in ev6[0][1],
+      "ổ còn 7 GB (dưới 10) → báo kèm nhóm chiếm nhiều nhất")
+ev7 = d.watch_once(now=t0 + 17060, ps_main="", batt=None, level="1", th={"state": "ok", "msg": "", "sources": []}, free=7 * d.GB)
+check(not ev7, "không báo lại ổ đầy liên tục mỗi phút")
+check(not d.watch_once(now=t0 + 21000, ps_main="", batt=None, level="1",
+                       th={"state": "ok", "msg": "", "sources": []}, free=50 * d.GB), "ổ còn nhiều → im lặng")
+w = d.watch_set(disk_gb=20, slowcharge=False)
+check(w["disk_gb"] == 20 and not w["slowcharge"] and d.watch_set(disk_gb=99999)["disk_gb"] == 500, "lưu ngưỡng ổ đĩa, giới hạn hợp lệ")
+cfg["watch"] = {"enabled": True, "minutes": 5, "metrics": True}; d.save_cfg(cfg)
+
 # --- lịch sử
 os.makedirs(d.DATA_DIR, exist_ok=True)
 with open(d.wpath("metrics.jsonl"), "w") as f:
