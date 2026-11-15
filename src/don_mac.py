@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "6.3.0"
+VERSION = "6.3.1"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -4199,11 +4199,15 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.autoenablesItems = false
         menu.removeAllItems()
         let lines = (data["lines"] as? [String]) ?? ["Đang đọc…"]
         for line in lines {
             let it = NSMenuItem(title: line, action: nil, keyEquivalent: "")
-            it.isEnabled = false
+            it.isEnabled = true
+            it.attributedTitle = NSAttributedString(string: line, attributes: [
+                .font: NSFont.menuFont(ofSize: 0),
+                .foregroundColor: NSColor.labelColor])
             menu.addItem(it)
         }
         let actions = (data["actions"] as? [[String: String]]) ?? []
@@ -4213,18 +4217,22 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for a in actions {
             let it = NSMenuItem(title: a["title"] ?? "", action: #selector(doAction(_:)), keyEquivalent: "")
             it.target = self
+            it.isEnabled = true
             it.representedObject = a["arg"] ?? ""
             menu.addItem(it)
         }
         menu.addItem(NSMenuItem.separator())
         let o = NSMenuItem(title: "Mở Spotless Mac", action: #selector(openApp), keyEquivalent: "")
         o.target = self
+        o.isEnabled = true
         menu.addItem(o)
         let r = NSMenuItem(title: "Làm mới", action: #selector(reload), keyEquivalent: "")
         r.target = self
+        r.isEnabled = true
         menu.addItem(r)
         let q = NSMenuItem(title: "Ẩn biểu tượng này", action: #selector(hideMenu), keyEquivalent: "")
         q.target = self
+        q.isEnabled = true
         menu.addItem(q)
     }
 

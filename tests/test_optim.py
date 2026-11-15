@@ -168,4 +168,6 @@ check(any(c["id"].startswith("transloc-") and c["action"] and c["action"]["src"]
       "app chạy dạng bản sao tạm (Translocation) → tìm bản gốc trong Tải về")
 check(not d.move_app("/etc/passwd")["ok"] and not d.move_app(HOME + "/Documents/X.app")["ok"], "chỉ cho chuyển app từ Tải về/Màn hình nền")
 check("NSStatusBar" in d.MENU_SWIFT and "--mini" in d.MENU_SWIFT, "mã Swift thanh menu có sẵn")
+check("autoenablesItems = false" in d.MENU_SWIFT and "NSColor.labelColor" in d.MENU_SWIFT,
+      "menu thanh trạng thái: các dòng thông tin hiện màu chữ bình thường, không bị xám")
 print(f"\nALL OPTIM TESTS PASSED ({n} kiểm tra)")
