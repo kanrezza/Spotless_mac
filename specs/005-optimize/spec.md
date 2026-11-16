@@ -23,3 +23,9 @@
 - **Máy nóng**: `thermal()` ở trạng thái `throttle` kéo dài N phút → báo kèm app đốt CPU nhiều nhất (nhắc lại tối đa 2 giờ/lần); trạng thái `hot` kéo dài ≥10 phút → nhắc nhẹ (tối đa 6 giờ/lần).
 - **Sắp hết dung lượng**: ổ còn dưới ngưỡng người dùng đặt (mặc định 10 GB) → báo kèm nhóm chiếm nhiều nhất ở lần quét gần nhất (tối đa 6 giờ/lần).
 - Hàm `sustained()` dùng chung cho mọi điều kiện cần “đúng liên tục đủ lâu mới báo”, kèm thời gian chờ giữa hai lần báo.
+
+## Bổ sung v6.4.0 — “Pin dùng được bao lâu”
+- Điện còn trong pin (Wh) = dung lượng thật (mAh) × điện áp × phần trăm pin; thời lượng = Wh ÷ W đang tiêu thụ. Khi đang cắm sạc thì trả lời “nếu rút sạc ngay bây giờ”.
+- Mức điện nền của máy (màn hình + macOS) lấy từ phân vị 10% của các mẫu `sys_w` đã ghi trong `metrics.jsonl`; chưa đủ dữ liệu thì dùng 5W và nói rõ là ước lượng chung.
+- Phần điện còn lại chia cho từng app theo “Tác động năng lượng”, từ đó tính đóng app nào thì pin dùng thêm được bao nhiêu phút (kèm số tiến trình, với trình duyệt là số tab), cộng dòng tổng “đóng cả N app” và mốc “chỉ để màn hình sáng”.
+- Hiển thị kèm ước tính của macOS (`AvgTimeToEmpty`) và giải thích vì sao hai con số lệch nhau.

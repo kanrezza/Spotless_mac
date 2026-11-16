@@ -39,7 +39,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "6.3.1"
+VERSION = "6.4.0"
 APP_NAME = "Spotless Mac"
 LEGACY_APP_NAMES = ("Dọn Mac",)  # tên cũ: bị gỡ khi cài bản mới (giữ nguyên mã gói/dữ liệu)
 APP_BUNDLE_ID = "local.donmac.app"
@@ -3751,7 +3751,7 @@ def battery_info(ioreg_text=None, pmset_text=None, light=False):
     full = bool(b.get("FullyCharged"))
     info = {"pct": pct, "connected": connected, "charging": charging, "full": full, "batt_w": batt_w, "sys_w": sys_w,
             "in_w": in_w, "adapter_w": adapter_w, "adapter": ad.get("Name") or ad.get("Description") or "",
-            "temp": temp, "cycles": b.get("CycleCount") or sp.get("cycles"), "health": health,
+            "temp": temp, "volt": round(volt, 2), "cycles": b.get("CycleCount") or sp.get("cycles"), "health": health,
             "condition": sp.get("condition") or "", "design_mah": design, "max_mah": rawmax,
             "tte": tte if isinstance(tte, int) and 0 < tte < 65535 else None,
             "ttf": ttf if isinstance(ttf, int) and 0 < ttf < 65535 else None,
@@ -3832,6 +3832,53 @@ def energy_apps(groups=None, top_text=None):
     return out[:15]
 
 
+def idle_watts(rows=None, fallback=5.0):
+    """Mức điện “nền” khi máy gần như rảnh: lấy từ các mẫu đã ghi (phân vị 10%), để biết phần nào là của app."""
+    vals = sorted(r["sys_w"] for r in (rows if rows is not None else read_jsonl("metrics.jsonl", 3000))
+                  if isinstance(r.get("sys_w"), (int, float)) and 1 <= r["sys_w"] <= 80)
+    if len(vals) < 8:
+        return fallback, "ước lượng chung (chưa đủ dữ liệu đã ghi)"
+    return round(vals[len(vals) // 10], 1), "đo từ lúc máy rảnh nhất trong lịch sử của bạn"
+
+
+def fmt_dur(mins):
+    mins = int(max(0, mins))
+    return f"{mins // 60} giờ {mins % 60} phút" if mins >= 60 else f"{mins} phút"
+
+
+def battery_runtime(b, apps, groups=None, rows=None):
+    """Pin còn dùng được bao lâu với mức tiêu thụ hiện tại, và đóng app nào thì thêm được bao nhiêu."""
+    if not b or not b.get("max_mah") or not b.get("volt"):
+        return None
+    wh_full = b["max_mah"] * b["volt"] / 1000.0
+    wh_left = wh_full * (b.get("pct") or 0) / 100.0
+    draw = b.get("sys_w") or (-b["batt_w"] if b["batt_w"] < 0 else 0)
+    if not draw or draw <= 0.5 or wh_left <= 0:
+        return None
+    base, base_src = idle_watts(rows)
+    base = min(base, draw * 0.8)
+    mins = wh_left / draw * 60
+    app_w = max(0.0, draw - base)
+    mine = [a for a in (apps or []) if not a["system"] and a["energy"] > 0]
+    tot = sum(a["energy"] for a in mine) or 1
+    nproc = {g["key"]: g["n"] for g in (groups or [])}
+    items = []
+    for a in mine[:4]:
+        w = app_w * a["energy"] / tot
+        if w < 0.2:
+            continue
+        nd = max(base * 0.9, draw - w)
+        items.append({"key": a["key"], "label": a["label"], "watts": round(w, 1), "browser": a.get("browser", ""),
+                      "procs": nproc.get(a["key"], 0), "gain": int(wh_left / nd * 60 - mins)})
+    allw = sum(i["watts"] for i in items)
+    nd = max(base, draw - allw)
+    return {"wh_left": round(wh_left, 1), "wh_full": round(wh_full, 1), "draw": round(draw, 1), "base": base,
+            "base_src": base_src, "mins": int(mins), "mac_mins": b.get("tte"), "on_battery": not b.get("connected"),
+            "items": items, "all": {"watts": round(allw, 1), "gain": int(wh_left / nd * 60 - mins),
+                                    "mins": int(wh_left / nd * 60), "n": len(items)},
+            "screen": int(wh_left / max(base * 0.75, 1) * 60)}
+
+
 def power_page():
     b = battery_info()
     hw = hw_model() if sys.platform == "darwin" else {}
@@ -3848,7 +3895,7 @@ def power_page():
     if any(a["stuck"] for a in apps):
         tips.append("Có tiến trình bị kẹt đang đốt CPU: buộc dừng nó ở tab Hoạt động là giảm điện ngay.")
     return {"battery": b, "hw": hw, "charger_rec": rec, "charger_advice": cadv, "low_power": (m.group(1) == "1") if m else None,
-            "apps": apps, "tips": tips, "t": time.time()}
+            "apps": apps, "tips": tips, "runtime": battery_runtime(b, apps, groups), "t": time.time()}
 
 
 # ---- thông báo + theo dõi nền
@@ -6565,6 +6612,7 @@ function renderPower(){
       ${p.charger_advice?`<p class="k" style="margin:4px 0 0">🔌 ${esc(p.charger_advice)}${b.adapter?` <span class="mut">(${esc(b.adapter)})</span>`:""}</p>`:""}
       ${p.tips.map(t=>`<div class="aflag warn">💡 ${esc(t)}</div>`).join("")}</div>`;
   }
+  h+=runtimeHTML(p);
   const apps=p.apps||[];const mx=Math.max(1,...apps.map(a=>a.energy));
   h+=`<div class="card"><h2>App tốn điện nhất lúc này</h2><p class="k">Chỉ số “Tác động năng lượng” giống cột cùng tên trong Giám sát hoạt động: tổng hợp CPU, GPU, đánh thức máy, mạng, ổ đĩa. Càng cao càng hao pin và nóng máy. Đo trong 1 giây, tự cập nhật mỗi 6 giây.</p>
     ${apps.length?`<table class="mini"><tr><th>App</th><th class="r">Năng lượng</th><th style="width:18%"></th><th class="r">CPU</th><th class="r">RAM</th><th>Nên làm gì</th><th></th></tr>
@@ -6585,6 +6633,25 @@ function renderPower(){
       Giữ pin bền: bật Sạc pin tối ưu, tránh để máy nóng khi sạc (không sạc trên chăn, gối), không cần xả cạn pin.</p></div>`;
   }
   return h;
+}
+const dur2=m=>{m=Math.max(0,Math.round(m));return m>=60?`${Math.floor(m/60)} giờ ${m%60} phút`:`${m} phút`};
+function runtimeHTML(p){
+  const r=p.runtime,b=p.battery;if(!r)return "";
+  const head=r.on_battery?`Pin còn dùng được khoảng`:`Nếu rút sạc ngay bây giờ, pin dùng được khoảng`;
+  return `<div class="card"><h2>Pin dùng được bao lâu</h2>
+    <p class="k">${head} <b style="font-size:17px">${dur2(r.mins)}</b> với đúng những gì bạn đang mở lúc này (${num(r.draw)}W).
+      ${r.mac_mins?`macOS ước tính ${dur2(r.mac_mins)} — hai con số lệch nhau là bình thường, vì macOS tính theo mức dùng trung bình vài phút trước.`:""}</p>
+    <div class="pflow" style="grid-template-columns:repeat(3,1fr)">
+      <div class="bx"><span class="mut">Điện còn trong pin</span><b>${num(r.wh_left)} Wh</b><span class="mut">trên ${num(r.wh_full)} Wh khi đầy</span></div>
+      <div class="bx"><span class="mut">Đang tiêu thụ</span><b>${num(r.draw)}W</b><span class="mut">máy rảnh chỉ tốn ~${num(r.base)}W</span></div>
+      <div class="bx"><span class="mut">Nếu chỉ để màn hình sáng</span><b>${dur2(r.screen)}</b><span class="mut">đóng hết app nặng</span></div></div>
+    ${r.items.length?`<p class="k" style="margin:10px 0 4px"><b>Đóng cái gì thì được thêm bao lâu?</b> Phần điện cố định (màn hình, macOS) khoảng ${num(r.base)}W — ${esc(r.base_src)} — phần còn lại chia cho các app theo mức tiêu thụ của chúng.</p>
+      <table class="mini"><tr><th>Đóng app</th><th class="r">Đang ngốn</th><th class="r">Pin dùng thêm</th><th></th></tr>
+      ${r.items.map(i=>`<tr><td><b>${esc(i.label)}</b>${i.procs?` <span class="mut">${i.procs} tiến trình${i.browser?" (mỗi tab là một tiến trình)":""}</span>`:""}</td>
+        <td class="num">${num(i.watts)}W</td><td class="num" style="color:var(--safe)">+${dur2(i.gain)}</td>
+        <td class="r">${i.browser?`<button class="link" data-ttabs="${esc(i.key)}">Xem tab</button>`:`<button class="link" data-goact="${esc(i.key)}">Chi tiết</button>`}</td></tr>`).join("")}
+      ${r.all.n>1?`<tr><td><b>Đóng cả ${r.all.n} app trên</b></td><td class="num">${num(r.all.watts)}W</td><td class="num" style="color:var(--safe)">+${dur2(r.all.gain)}</td><td class="r mut">còn ${dur2(r.all.mins)}</td></tr>`:""}</table>`:""}
+    <p class="k" style="margin-top:8px">Đây là ước tính theo mức tiêu thụ ngay lúc này, nên nó đổi liên tục. Độ sáng màn hình là thứ ảnh hưởng mạnh nhất sau app: giảm vài nấc thường được thêm 30–60 phút.</p></div>`;
 }
 function renderChecks(){
   const c=OP.checks;if(!c)return spinCard("Đang kiểm tra cài đặt…");

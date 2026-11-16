@@ -91,6 +91,8 @@ _IO = _p.dumps([{"CurrentCapacity": 64, "MaxCapacity": 100, "Voltage": 12500, "I
 _orig_bi = d.battery_info
 d.battery_info = lambda *a, **k: _orig_bi(_IO, "")
 d.hw_model = lambda: {"name": "MacBook Air", "model": "Mac14,2", "chip": "Apple M2"}
+_orig_idle = d.idle_watts
+d.idle_watts = lambda rows=None, fallback=5.0: _orig_idle([{"sys_w": v} for v in (5, 5.2, 5.5, 6, 6, 7, 9, 12, 20, 28, 33, 35)])
 _orig_ea = d.energy_apps
 d.energy_apps = lambda groups=None, top_text=None: _orig_ea(groups, f"PID POWER COMMAND\nPID POWER COMMAND\n{victim.pid} 150.2 c\n41983 22.5 b\n7000 9.1 q\n")
 H = os.environ["HOME"]

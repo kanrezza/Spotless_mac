@@ -21,6 +21,10 @@ const ok = m => console.log('✓ ' + m);
     const pw = await p.$eval('#o-body', x => x.textContent);
     if (!pw.includes('TỤT') || !pw.includes('30W') || !pw.includes('33')) fail('Pin & sạc thiếu cảnh báo tụt pin: ' + pw.slice(0, 300)); ok('Pin & sạc: cảnh báo pin tụt, củ 30W, máy dùng 33W');
     if (!pw.includes('Claude') || !pw.includes('Sức khỏe pin') || !pw.includes('86%')) fail('thiếu app tốn điện/sức khỏe pin'); ok('app tốn điện + sức khỏe pin 86%');
+    if (!pw.includes('Pin dùng được bao lâu') || !pw.includes('Nếu rút sạc ngay bây giờ') || !pw.includes('Đóng cái gì thì được thêm bao lâu'))
+      fail('thiếu mục pin dùng được bao lâu: ' + pw.slice(0, 400));
+    if (!/\d+ tiến trình/.test(pw)) fail('thiếu số tiến trình trong bảng pin');
+    ok('Pin dùng được bao lâu: thời lượng, Wh, đóng app nào thêm bao lâu');
     await p.screenshot({path: `${OUT}/optim-power-${scheme}.png`, fullPage: true});
     await p.click('[data-osub=checks]');
     await p.waitForSelector('.ock', {timeout: 20000});

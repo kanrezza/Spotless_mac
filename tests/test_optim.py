@@ -50,6 +50,31 @@ ms = d.mini_status(g, None, b)
 check(ms["title"].startswith("⚠︎") and "⚡︎" in ms["title"] and ms["actions"][0]["arg"] == "kill:900:chrome_crashpad_handler",
       "thanh menu: ⚠︎ khi kẹt, ⚡︎ khi pin tụt, có nút buộc dừng")
 
+# --- pin dùng được bao lâu
+APPS = [{"key": "b", "label": "Brave Browser", "energy": 60.0, "system": False, "browser": "chromium"},
+        {"key": "c", "label": "ChatGPT", "energy": 30.0, "system": False, "browser": ""},
+        {"key": "w", "label": "WindowServer", "energy": 50.0, "system": True, "browser": ""}]
+GR = [{"key": "b", "n": 36}, {"key": "c", "n": 5}]
+MET = [{"sys_w": v} for v in (5, 5.2, 5.5, 6, 6, 7, 9, 12, 20, 28, 33, 35)]
+bb = d.battery_info(ioreg(ExternalConnected=False, IsCharging=False, InstantAmperage=2 ** 64 - 1600,
+                          PowerTelemetryData={}, CurrentCapacity=50), "")
+rt = d.battery_runtime(bb, APPS, GR, MET)
+check(rt and rt["on_battery"] and abs(rt["draw"] - 20.0) < 0.1, "đang chạy pin: tính đúng mức tiêu thụ 20W")
+check(abs(rt["wh_full"] - 3780 * 12.5 / 1000) < 0.2 and abs(rt["wh_left"] - rt["wh_full"] / 2) < 0.2,
+      "điện còn trong pin = dung lượng × điện áp × phần trăm")
+check(abs(rt["mins"] - rt["wh_left"] / 20 * 60) < 1.5, "giờ dùng được = Wh còn lại ÷ W đang dùng")
+check(rt["base"] == 5.2, "mức điện nền lấy từ lịch sử đã ghi (phân vị 10%)")
+it = {x["label"]: x for x in rt["items"]}
+check(len(rt["items"]) == 2 and "WindowServer" not in it, "chỉ tính app của bạn, bỏ thành phần macOS")
+check(abs(it["Brave Browser"]["watts"] - (20 - 5.2) * 2 / 3) < 0.2 and it["Brave Browser"]["procs"] == 36,
+      "chia phần điện của app theo mức tiêu thụ, kèm số tiến trình")
+check(it["Brave Browser"]["gain"] > it["ChatGPT"]["gain"] > 0 and rt["all"]["gain"] > it["Brave Browser"]["gain"],
+      "đóng app nặng hơn thì được thêm nhiều phút hơn; đóng hết thì nhiều nhất")
+check(rt["screen"] > rt["all"]["mins"] >= rt["mins"], "chỉ để màn hình sáng là lâu nhất")
+rt2 = d.battery_runtime(d.battery_info(ioreg(), ""), APPS, GR, MET)
+check(rt2 and not rt2["on_battery"] and rt2["draw"] == 33.0, "đang cắm sạc: vẫn ước tính “nếu rút sạc bây giờ”")
+check(d.battery_runtime(None, APPS) is None and d.idle_watts([], 5.0)[0] == 5.0, "thiếu dữ liệu → không đoán bừa")
+
 # --- theo dõi nền: tiến trình kẹt 5 phút → tự buộc dừng (tiến trình thật tên crashpad)
 tmpd = os.path.join(HOME, "bin"); os.makedirs(tmpd)
 exe = os.path.join(tmpd, "crashpad"); shutil.copy("/bin/sleep", exe)
